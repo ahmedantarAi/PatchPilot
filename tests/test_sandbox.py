@@ -9,6 +9,7 @@ import os
 import subprocess
 import sys
 import tarfile
+import tempfile
 from pathlib import Path
 from types import ModuleType
 
@@ -17,6 +18,9 @@ import pytest
 from patchpilot.sandbox import (
     HOSTILE_FIXTURES,
     MAX_OUTPUT_BYTES,
+    MAX_PATCH_BYTES,
+    MAX_TAR_FILE_BYTES,
+    MAX_TAR_MEMBERS,
     HostileFixture,
     PatchApplyError,
     SandboxBusyError,
@@ -31,11 +35,11 @@ from patchpilot.sandbox import (
     compute_deps_volume_name,
     is_container_present,
     list_leftover_containers,
-    parse_junit_xml,
     read_stream_capped,
     run_single_fixture,
     safe_extract_tar,
     validate_deps_volume_name,
+    validate_junit_summary,
     validate_requirements,
     validate_safe_relative_path,
     verify_install_step_no_repo_code,
@@ -256,7 +260,6 @@ def test_single_run_lock_in_process_and_cross_process(tmp_path: Path) -> None:
     lock_file = tmp_path / "sandbox.lock"
     verify_single_run_lock(lock_file)
 
-    # Verify lock can be re-acquired cleanly after release
     with SandboxLock(lock_file):
         with pytest.raises(SandboxBusyError):
             with SandboxLock(lock_file):
@@ -272,7 +275,7 @@ def test_single_run_lock_in_process_and_cross_process(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 4. Unit tests — 1 MB output cap, JUnit XML parser, Docker flags, and logging
+# 4. Unit tests — Capped output, JSON summary, injection prevention, limits
 # ---------------------------------------------------------------------------
 
 
@@ -288,7 +291,7 @@ def test_stream_output_capped_at_1mb() -> None:
     assert len(text2) == MAX_OUTPUT_BYTES
 
 
-def test_parse_junit_xml_structured_counts() -> None:
+def test_container_parses_junit_to_json_and_host_validates() -> None:
     sample_xml = """<?xml version="1.0" encoding="utf-8"?>
     <testsuites>
       <testsuite name="pytest" tests="3" errors="0" failures="1" skipped="1">
@@ -302,16 +305,39 @@ def test_parse_junit_xml_structured_counts() -> None:
       </testsuite>
     </testsuites>
     """
-    report = parse_junit_xml(sample_xml)
+    summary = CONTAINER_RUNNER.parse_junit_xml(sample_xml)
+    assert summary["tests"] == 3
+    assert summary["passed"] == 1
+    assert summary["failures"] == 1
+    assert summary["errors"] == 0
+    assert summary["skipped"] == 1
+    assert len(summary["cases"]) == 3
+    assert summary["cases"][0]["status"] == "passed"
+    assert summary["cases"][1]["status"] == "failed"
+    assert summary["cases"][2]["status"] == "skipped"
+
+    # Host validates only the JSON summary (Fix 1)
+    report = validate_junit_summary(summary)
     assert report.tests == 3
     assert report.passed == 1
     assert report.failures == 1
-    assert report.errors == 0
-    assert report.skipped == 1
-    assert len(report.cases) == 3
     assert report.cases[0].status == "passed"
-    assert report.cases[1].status == "failed"
-    assert report.cases[2].status == "skipped"
+
+
+def test_hostile_xml_with_doctype_entity_expansion_rejected() -> None:
+    # Fix 1: Hostile XML with DOCTYPE/entity expansion must produce clean error
+    hostile_xml = (
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        "<!DOCTYPE bomb [\n"
+        '  <!ENTITY a "1234567890">\n'
+        '  <!ENTITY b "&a;&a;&a;&a;&a;&a;&a;&a;&a;&a;">\n'
+        '  <!ENTITY c "&b;&b;&b;&b;&b;&b;&b;&b;&b;&b;">\n'
+        ']><testsuites><testsuite name="pwn"><testcase name="&c;"/></testsuite></testsuites>'
+    )
+    summary = CONTAINER_RUNNER.parse_junit_xml(hostile_xml)
+    assert "error" in summary or summary["tests"] == 0
+    report = validate_junit_summary(summary)
+    assert report.tests == 0
 
 
 def test_docker_run_cmd_enforces_all_spec_controls(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -320,6 +346,7 @@ def test_docker_run_cmd_enforces_all_spec_controls(monkeypatch: pytest.MonkeyPat
 
     cmd = build_docker_run_cmd("patchpilot-sbx-test123456")
     assert cmd[:4] == ["docker", "run", "--rm", "-i"]
+    assert "--label" in cmd and cmd[cmd.index("--label") + 1] == "patchpilot.sandbox=1"
     assert "--network" in cmd and cmd[cmd.index("--network") + 1] == "none"
     assert "--user" in cmd and cmd[cmd.index("--user") + 1] == "10001:10001"
     assert "--cap-drop" in cmd and cmd[cmd.index("--cap-drop") + 1] == "ALL"
@@ -342,6 +369,9 @@ def test_docker_run_cmd_enforces_all_spec_controls(monkeypatch: pytest.MonkeyPat
     assert "PYTHONPATH=/deps" in cmd_with_deps
 
     install_cmd = build_docker_install_cmd("patchpilot-sbx-deps1234", vol)
+    assert "--label" in install_cmd
+    lbl_idx = install_cmd.index("--label")
+    assert install_cmd[lbl_idx + 1] == "patchpilot.sandbox=1"
     assert f"{vol}:/deps:rw" in install_cmd
     assert install_cmd[-1] == "--install-deps"
 
@@ -372,6 +402,53 @@ def test_validate_requirements_and_volume_names() -> None:
     for invalid_vol in ("/host/path", "C:\\Windows", "patchpilot-deps-../evil", "other-vol"):
         with pytest.raises(ValueError):
             validate_deps_volume_name(invalid_vol)
+
+
+def test_injection_resistance_case_names_and_file_paths() -> None:
+    # Fix 9: Case names or file paths cannot inject extra docker run arguments
+    malicious_case_name = "test_fn; rm -rf /; --privileged --volume /:/host"
+    malicious_path = "src/evil$(reboot);touch pwned/mod.py"
+    tar_bytes = build_repo_tar(
+        files={malicious_path: "X = 1\n"},
+        pytest_args=["-k", malicious_case_name],
+    )
+    cmd = build_docker_run_cmd("patchpilot-sbx-testsafe")
+    assert not any(malicious_case_name in arg for arg in cmd)
+    assert not any(malicious_path in arg for arg in cmd)
+    assert "--privileged" not in cmd
+
+    with tempfile.TemporaryDirectory() as tmp:
+        work_dir = Path(tmp)
+        extracted = safe_extract_tar(io.BytesIO(tar_bytes), work_dir)
+        assert extracted.pytest_args == ["-k", malicious_case_name]
+        assert (work_dir / malicious_path).is_file()
+
+
+def test_oversize_inputs_rejected_cleanly(tmp_path: Path) -> None:
+    # Fix 9: Documented maximum size and file count; oversize input rejected cleanly
+    oversize_patch = "--- a/f.py\n+++ b/f.py\n@@ -1,1 +1,1 @@\n-" + ("X" * (MAX_PATCH_BYTES + 1024))
+    with pytest.raises(PatchApplyError, match="Patch exceeds maximum size"):
+        apply_unified_diff(oversize_patch, tmp_path)
+
+    with pytest.raises(ValueError, match="Patch diff size exceeds limit"):
+        build_repo_tar(patch_diff=oversize_patch)
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tar:
+        ti = tarfile.TarInfo(name="bigfile.bin")
+        ti.size = MAX_TAR_FILE_BYTES + 1024
+        tar.addfile(ti)
+    with pytest.raises(TarSafetyError, match="exceeds per-file limit"):
+        safe_extract_tar(io.BytesIO(buf.getvalue()), tmp_path)
+
+    buf2 = io.BytesIO()
+    with tarfile.open(fileobj=buf2, mode="w") as tar:
+        for i in range(MAX_TAR_MEMBERS + 5):
+            ti = tarfile.TarInfo(name=f"file_{i}.txt")
+            ti.size = 0
+            tar.addfile(ti)
+    with pytest.raises(TarSafetyError, match="exceeds 10000 entries"):
+        safe_extract_tar(io.BytesIO(buf2.getvalue()), tmp_path)
 
 
 # ---------------------------------------------------------------------------
@@ -432,3 +509,112 @@ def test_docker_clean_patch_and_two_step_deps() -> None:
         check=False,
     )
     assert proc.stdout.strip() == ""
+
+
+@pytest.mark.docker
+def test_docker_orchestrator_start_removes_leftover_containers() -> None:
+    # Fix 8: On orchestrator start, remove any leftover container with label patchpilot.sandbox=1
+    dummy_name = "patchpilot-sbx-leftover-test"
+    subprocess.run(["docker", "rm", "-f", dummy_name], capture_output=True, check=False)
+    subprocess.run(
+        [
+            "docker",
+            "create",
+            "--name",
+            dummy_name,
+            "--label",
+            "patchpilot.sandbox=1",
+            "patchpilot-sandbox:0.0.0",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    assert is_container_present(dummy_name)
+
+    # Initializing SandboxRunner triggers cleanup_leftover_containers()
+    _ = SandboxRunner(cleanup_on_start=True)
+    assert not is_container_present(dummy_name)
+    assert dummy_name not in list_leftover_containers()
+
+
+@pytest.mark.docker
+def test_docker_hostile_xml_from_sandboxed_code() -> None:
+    # Fix 1: Sandboxed code writing hostile XML with DOCTYPE/entity expansion produces clean error
+    runner = SandboxRunner()
+    res = runner.run_sync(
+        files={
+            "conftest.py": (
+                "import pytest\n"
+                "from pathlib import Path\n\n"
+                "def pytest_unconfigure(config):\n"
+                "    Path('/tmp/patchpilot_junit.xml').write_text(\n"
+                "        '<!DOCTYPE bomb [<!ENTITY a \"123\">]><testsuites/>',\n"
+                "        encoding='utf-8',\n"
+                "    )\n"
+            ),
+            "test_sample.py": "def test_ok(): pass\n",
+        }
+    )
+    assert res.error == "Hostile XML: DOCTYPE/ENTITY declarations rejected"
+    assert res.exit_code != 0
+    assert res.junit.tests == 0
+
+
+# ---------------------------------------------------------------------------
+# 6. Docker Mutation Test Suite (marked `docker`) (Fix 3)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.docker
+def test_mutation_network() -> None:
+    # Weakened network: --network bridge instead of --network none
+    fixture = next(f for f in HOSTILE_FIXTURES if f.name == "network_egress")
+    weak_runner = SandboxRunner(override_limits={"network": "bridge"})
+    res = run_single_fixture(weak_runner, fixture)
+    assert not fixture.check_contained(res), (
+        "network_egress fixture reported CONTAINED under weakened network config (--network bridge)"
+    )
+
+
+@pytest.mark.docker
+def test_mutation_pids_limit() -> None:
+    # Weakened pids: --pids-limit 1024 instead of 256
+    fixture = next(f for f in HOSTILE_FIXTURES if f.name == "fork_bomb")
+    weak_runner = SandboxRunner(override_limits={"pids_limit": 1024})
+    res = run_single_fixture(weak_runner, fixture)
+    assert not fixture.check_contained(res), (
+        "fork_bomb fixture reported CONTAINED under weakened pids-limit config (1024)"
+    )
+
+
+@pytest.mark.docker
+def test_mutation_memory() -> None:
+    # Weakened memory: 2048m instead of 768m
+    fixture = next(f for f in HOSTILE_FIXTURES if f.name == "memory_balloon")
+    weak_runner = SandboxRunner(override_limits={"memory": "2048m", "memory_swap": "2048m"})
+    res = run_single_fixture(weak_runner, fixture)
+    assert not fixture.check_contained(res), (
+        "memory_balloon fixture reported CONTAINED under weakened memory config (2048m)"
+    )
+
+
+@pytest.mark.docker
+def test_mutation_read_only_root() -> None:
+    # Weakened filesystem: read_only=False instead of True
+    fixture = next(f for f in HOSTILE_FIXTURES if f.name == "write_outside_work")
+    weak_runner = SandboxRunner(override_limits={"read_only": False})
+    res = run_single_fixture(weak_runner, fixture)
+    assert not fixture.check_contained(res), (
+        "write_outside_work fixture reported CONTAINED under weakened rootfs config (read-write)"
+    )
+
+
+@pytest.mark.docker
+def test_mutation_user_caps() -> None:
+    # Weakened user/caps: user="0:0" and caps not dropped
+    fixture = next(f for f in HOSTILE_FIXTURES if f.name == "read_host_env")
+    weak_runner = SandboxRunner(override_limits={"user": "0:0", "cap_drop": None})
+    res = run_single_fixture(weak_runner, fixture)
+    assert not fixture.check_contained(res), (
+        "read_host_env fixture reported CONTAINED under weakened user/caps config (root/caps)"
+    )

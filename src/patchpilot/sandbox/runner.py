@@ -25,14 +25,14 @@ from patchpilot.sandbox.tar_and_diff import (
     MAX_OUTPUT_BYTES,
     JUnitReport,
     build_repo_tar,
-    parse_junit_xml,
     read_stream_capped,
+    validate_junit_summary,
 )
 
 logger = logging.getLogger("patchpilot.sandbox")
 
 SANDBOX_IMAGE = "patchpilot-sandbox:0.0.0"
-SANDBOX_LABEL = "patchpilot.sandbox=true"
+SANDBOX_LABEL = "patchpilot.sandbox=1"
 SANDBOX_CONTAINER_PREFIX = "patchpilot-sbx-"
 SANDBOX_DEPS_VOLUME_PREFIX = "patchpilot-deps-"
 DEFAULT_TIMEOUT_S = 120.0
@@ -239,6 +239,15 @@ def build_docker_run_cmd(
     *,
     image: str = SANDBOX_IMAGE,
     deps_volume: str | None = None,
+    network: str = "none",
+    user: str = "10001:10001",
+    cap_drop: str | None = "ALL",
+    security_opt: str | None = "no-new-privileges",
+    read_only: bool = True,
+    memory: str = "768m",
+    memory_swap: str = "768m",
+    cpus: str = "1",
+    pids_limit: int | str = 256,
 ) -> list[str]:
     """Build the hardened `docker run` command with all mandatory SPEC §6 controls."""
     cmd = [
@@ -251,27 +260,32 @@ def build_docker_run_cmd(
         "--label",
         SANDBOX_LABEL,
         "--network",
-        "none",
+        str(network),
         "--user",
-        "10001:10001",
-        "--cap-drop",
-        "ALL",
-        "--security-opt",
-        "no-new-privileges",
-        "--read-only",
-        "--tmpfs",
-        "/work:rw,nosuid,size=256m,uid=10001,gid=10001",
-        "--tmpfs",
-        "/tmp:rw,noexec,nosuid,size=128m",
-        "--memory",
-        "768m",
-        "--memory-swap",
-        "768m",
-        "--cpus",
-        "1",
-        "--pids-limit",
-        "256",
+        str(user),
     ]
+    if cap_drop:
+        cmd.extend(["--cap-drop", str(cap_drop)])
+    if security_opt:
+        cmd.extend(["--security-opt", str(security_opt)])
+    if read_only:
+        cmd.append("--read-only")
+    cmd.extend(
+        [
+            "--tmpfs",
+            "/work:rw,nosuid,size=256m,uid=10001,gid=10001",
+            "--tmpfs",
+            "/tmp:rw,noexec,nosuid,size=128m",
+            "--memory",
+            str(memory),
+            "--memory-swap",
+            str(memory_swap),
+            "--cpus",
+            str(cpus),
+            "--pids-limit",
+            str(pids_limit),
+        ]
+    )
     if deps_volume is not None:
         validate_deps_volume_name(deps_volume)
         cmd.extend(["-v", f"{deps_volume}:/deps:ro", "-e", "PYTHONPATH=/deps"])
@@ -285,10 +299,11 @@ def build_docker_install_cmd(
     *,
     image: str = SANDBOX_IMAGE,
     network: str = "bridge",
+    find_links_host_dir: str | Path | None = None,
 ) -> list[str]:
     """Build the `docker run` command for the isolated two-step dependency installer."""
     validate_deps_volume_name(volume_name)
-    return [
+    cmd = [
         "docker",
         "run",
         "--rm",
@@ -320,9 +335,12 @@ def build_docker_install_cmd(
         "256",
         "-v",
         f"{volume_name}:/deps:rw",
-        image,
-        "--install-deps",
     ]
+    if find_links_host_dir is not None:
+        host_posix = Path(find_links_host_dir).resolve().as_posix()
+        cmd.extend(["-v", f"{host_posix}:/test-wheels:ro"])
+    cmd.extend([image, "--install-deps"])
+    return cmd
 
 
 def _minimal_docker_client_env() -> dict[str, str]:
@@ -402,11 +420,11 @@ def is_container_present(container_name: str) -> bool:
     return container_name in names
 
 
-def list_leftover_containers() -> list[str]:
+def list_leftover_containers(label: str = SANDBOX_LABEL) -> list[str]:
     """List any remaining sandbox containers matching the sandbox label or name prefix."""
     env = _minimal_docker_client_env()
     found: set[str] = set()
-    for flt in (f"label={SANDBOX_LABEL}", f"name={SANDBOX_CONTAINER_PREFIX}"):
+    for flt in (f"label={label}", f"name={SANDBOX_CONTAINER_PREFIX}"):
         proc = subprocess.run(
             ["docker", "ps", "-a", "--filter", flt, "--format", "{{.Names}}"],
             capture_output=True,
@@ -422,9 +440,9 @@ def list_leftover_containers() -> list[str]:
     return sorted(found)
 
 
-def cleanup_leftover_containers() -> list[str]:
+def cleanup_leftover_containers(label: str = SANDBOX_LABEL) -> list[str]:
     """Force-remove any leftover sandbox containers and return the names removed."""
-    leftovers = list_leftover_containers()
+    leftovers = list_leftover_containers(label=label)
     for name in leftovers:
         force_kill_and_remove_container(name)
     return leftovers
@@ -452,17 +470,23 @@ class SandboxRunner:
         image: str = SANDBOX_IMAGE,
         timeout_s: float = DEFAULT_TIMEOUT_S,
         lock_path: Path = DEFAULT_LOCK_PATH,
+        cleanup_on_start: bool = True,
+        override_limits: dict[str, object] | None = None,
     ) -> None:
         self.image = image
         self.timeout_s = timeout_s
         self.lock_path = lock_path
+        self.override_limits = dict(override_limits or {})
         self.run_logs: list[SandboxRunLog] = []
+        if cleanup_on_start:
+            cleanup_leftover_containers()
 
     def install_dependencies_sync(
         self,
         requirements: Sequence[str],
         *,
         find_links: str | None = None,
+        find_links_host_dir: str | Path | None = None,
         network: str = "bridge",
         timeout_s: float | None = None,
     ) -> InstallStepResult:
@@ -471,16 +495,22 @@ class SandboxRunner:
         volume_name = compute_deps_volume_name(validated)
         effective_timeout = timeout_s if timeout_s is not None else self.timeout_s
         container_name = f"{SANDBOX_CONTAINER_PREFIX}deps-{uuid.uuid4().hex[:12]}"
+
+        effective_find_links = find_links
+        if find_links_host_dir is not None and not find_links:
+            effective_find_links = "/test-wheels"
+
         cmd = build_docker_install_cmd(
             container_name,
             volume_name,
             image=self.image,
             network=network,
+            find_links_host_dir=find_links_host_dir,
         )
         stdin_payload = json.dumps(
             {
                 "requirements": validated,
-                "find_links": find_links,
+                "find_links": effective_find_links,
             }
         ).encode("utf-8")
 
@@ -584,16 +614,20 @@ class SandboxRunner:
             )
         )
         container_name = f"{SANDBOX_CONTAINER_PREFIX}{uuid.uuid4().hex[:12]}"
+        run_kwargs: dict[str, object] = {
+            "image": self.image,
+            "deps_volume": deps_volume,
+            **self.override_limits,
+        }
         cmd = build_docker_run_cmd(
             container_name,
-            image=self.image,
-            deps_volume=deps_volume,
+            **run_kwargs,  # type: ignore[arg-type]
         )
         flags = cmd[2:-1]
 
         with SandboxLock(self.lock_path):
             image_digest = get_image_digest(self.image)
-            limits = {**SANDBOX_LIMITS, "timeout_s": effective_timeout}
+            limits = {**SANDBOX_LIMITS, **self.override_limits, "timeout_s": effective_timeout}
             t0 = time.monotonic()
             timed_out = False
             exit_code = -1
@@ -704,9 +738,7 @@ class SandboxRunner:
         timeout_s: float | None = None,
         tar_bytes: bytes | None = None,
     ) -> SandboxResult:
-        """Async wrapper around `run_sync` that fails fast with `SandboxBusyError` if locked."""
-        if _IN_PROCESS_LOCK.locked():
-            raise SandboxBusyError("Sandbox is busy: in-process lock is already held")
+        """Async wrapper around `run_sync` running under the thread lock."""
         return await asyncio.to_thread(
             self.run_sync,
             repo_dir,
@@ -764,10 +796,7 @@ def _parse_container_output(
 
         raw_junit = payload.get("junit")
         junit_xml = str(payload.get("junit_xml", ""))[:MAX_OUTPUT_BYTES]
-        if isinstance(raw_junit, dict):
-            junit_report = JUnitReport.model_validate(raw_junit)
-        else:
-            junit_report = parse_junit_xml(junit_xml)
+        junit_report = validate_junit_summary(raw_junit)
 
         inner_stdout = str(payload.get("stdout", ""))[:MAX_OUTPUT_BYTES]
         inner_stderr = str(payload.get("stderr", ""))[:MAX_OUTPUT_BYTES]

@@ -27,9 +27,14 @@ from pathlib import Path
 from typing import BinaryIO
 
 MAX_OUTPUT_BYTES = 1_048_576  # 1 MB cap per SPEC §6
+MAX_PATCH_BYTES = 10 * 1024 * 1024  # 10 MB max patch size
 MAX_TAR_FILE_BYTES = 32 * 1024 * 1024  # 32 MB per single file
 MAX_TAR_TOTAL_BYTES = 200 * 1024 * 1024  # 200 MB total unpacked
 MAX_TAR_MEMBERS = 10_000
+
+MAX_JUNIT_CASES = 500
+MAX_JUNIT_STR_LEN = 1024
+MAX_JUNIT_MSG_LEN = 4096
 
 META_PREFIX = "__patchpilot__/"
 PATCH_MEMBER_NAME = "__patchpilot__/patch.diff"
@@ -94,7 +99,6 @@ def validate_safe_relative_path(raw_path: str, work_dir: Path) -> Path:
     work_resolved = work_dir.resolve()
     candidate = work_dir.joinpath(*parts)
 
-    # Walk existing parent chain to guarantee no parent directory is a symlink.
     current = work_dir
     for part in parts:
         current = current / part
@@ -148,9 +152,16 @@ def safe_extract_tar(stream: BinaryIO, work_dir: Path) -> ExtractedPayload:
                 if normalized_name == PATCH_MEMBER_NAME:
                     if not member.isreg():
                         raise TarSafetyError("Patch metadata entry must be a regular file")
+                    if member.size > MAX_PATCH_BYTES:
+                        raise TarSafetyError(
+                            f"Patch size {member.size} exceeds {MAX_PATCH_BYTES} limit"
+                        )
                     fobj = tar.extractfile(member)
                     if fobj is not None:
-                        payload.patch_diff = fobj.read(MAX_TAR_FILE_BYTES).decode("utf-8")
+                        data = fobj.read(MAX_PATCH_BYTES + 1)
+                        if len(data) > MAX_PATCH_BYTES:
+                            raise TarSafetyError("Patch exceeded maximum size limit")
+                        payload.patch_diff = data.decode("utf-8")
                     continue
 
                 if normalized_name == META_MEMBER_NAME:
@@ -196,7 +207,6 @@ def _clean_diff_path(header_path: str, work_dir: Path) -> str:
         return "/dev/null"
     if (path_part.startswith("a/") or path_part.startswith("b/")) and len(path_part) > 2:
         stripped = path_part[2:]
-        # Only keep a/ or b/ if a literal a/ or b/ directory already exists for that path
         try:
             literal_candidate = validate_safe_relative_path(path_part, work_dir)
             if literal_candidate.exists():
@@ -211,6 +221,8 @@ def parse_unified_diff(diff_text: str, work_dir: Path) -> list[FilePatch]:
     """Parse a unified diff string into structured `FilePatch` objects."""
     if not diff_text.strip():
         return []
+    if len(diff_text.encode("utf-8")) > MAX_PATCH_BYTES:
+        raise PatchApplyError(f"Patch exceeds maximum size of {MAX_PATCH_BYTES} bytes")
 
     raw_lines = diff_text.splitlines()
     idx = 0
@@ -258,7 +270,6 @@ def parse_unified_diff(diff_text: str, work_dir: Path) -> list[FilePatch]:
                     idx += 1
                     continue
                 if hline == "" and seen_old < old_count and seen_new < new_count:
-                    # Handle editors that strip the single space on blank context lines
                     hunk_lines.append(" ")
                     seen_old += 1
                     seen_new += 1
@@ -320,6 +331,8 @@ def apply_unified_diff(diff_text: str, work_dir: Path) -> int:
     """Apply a unified diff inside `work_dir` atomically. Returns number of patched files."""
     if not diff_text.strip():
         return 0
+    if len(diff_text.encode("utf-8")) > MAX_PATCH_BYTES:
+        raise PatchApplyError(f"Patch exceeds maximum size of {MAX_PATCH_BYTES} bytes")
 
     try:
         patches = parse_unified_diff(diff_text, work_dir)
@@ -361,7 +374,7 @@ def apply_unified_diff(diff_text: str, work_dir: Path) -> int:
             orig_lines = raw_content.splitlines()
 
         result_lines: list[str] = []
-        src_idx = 0  # 0-based index into orig_lines
+        src_idx = 0
         no_newline_at_eof = not had_trailing_newline
 
         for hunk in fpatch.hunks:
@@ -464,7 +477,10 @@ def read_stream_capped(stream: BinaryIO, cap_bytes: int = MAX_OUTPUT_BYTES) -> t
 
 
 def parse_junit_xml(xml_text: str) -> dict[str, object]:
-    """Parse pytest JUnit XML into a structured summary dictionary."""
+    """Parse pytest JUnit XML into a small structured summary dictionary with caps.
+
+    Safely handles or rejects hostile XML (e.g. DOCTYPE/entity expansion declarations).
+    """
     summary: dict[str, object] = {
         "tests": 0,
         "failures": 0,
@@ -476,14 +492,16 @@ def parse_junit_xml(xml_text: str) -> dict[str, object]:
     if not xml_text.strip():
         return summary
 
-    try:
-        root = ET.fromstring(xml_text)
-    except ET.ParseError:
+    # Reject DOCTYPE / ENTITY declarations which are never legitimate in pytest JUnit XML
+    if "<!DOCTYPE" in xml_text or "<!ENTITY" in xml_text:
+        summary["error"] = "Hostile XML: DOCTYPE/ENTITY declarations rejected"
         return summary
 
-    suites = [root] if root.tag == "testsuite" else list(root.findall(".//testsuite"))
-    if not suites and root.tag == "testsuites":
-        suites = [root]
+    try:
+        root = ET.fromstring(xml_text)
+    except Exception as exc:
+        summary["error"] = f"XMLParseError: {exc}"
+        return summary
 
     cases_list: list[dict[str, object]] = []
     tests_total = 0
@@ -493,13 +511,6 @@ def parse_junit_xml(xml_text: str) -> dict[str, object]:
 
     for tc in root.findall(".//testcase"):
         tests_total += 1
-        classname = tc.attrib.get("classname", "")
-        name = tc.attrib.get("name", "")
-        try:
-            time_s = float(tc.attrib.get("time", "0") or "0")
-        except ValueError:
-            time_s = 0.0
-
         failure_el = tc.find("failure")
         error_el = tc.find("error")
         skipped_el = tc.find("skipped")
@@ -509,35 +520,45 @@ def parse_junit_xml(xml_text: str) -> dict[str, object]:
         if failure_el is not None:
             status = "failed"
             failures_total += 1
-            message = (failure_el.attrib.get("message") or failure_el.text or "")[:4096]
+            msg_raw = failure_el.attrib.get("message") or failure_el.text or ""
+            message = msg_raw[:MAX_JUNIT_MSG_LEN]
         elif error_el is not None:
             status = "error"
             errors_total += 1
-            message = (error_el.attrib.get("message") or error_el.text or "")[:4096]
+            msg_raw = error_el.attrib.get("message") or error_el.text or ""
+            message = msg_raw[:MAX_JUNIT_MSG_LEN]
         elif skipped_el is not None:
             status = "skipped"
             skipped_total += 1
-            message = (skipped_el.attrib.get("message") or skipped_el.text or "")[:4096]
+            msg_raw = skipped_el.attrib.get("message") or skipped_el.text or ""
+            message = msg_raw[:MAX_JUNIT_MSG_LEN]
 
-        cases_list.append(
-            {
-                "classname": classname,
-                "name": name,
-                "time": time_s,
-                "status": status,
-                "message": message,
-            }
-        )
+        if len(cases_list) < MAX_JUNIT_CASES:
+            classname = (tc.attrib.get("classname", "") or "")[:MAX_JUNIT_STR_LEN]
+            name = (tc.attrib.get("name", "") or "")[:MAX_JUNIT_STR_LEN]
+            try:
+                time_s = float(tc.attrib.get("time", "0") or "0")
+            except ValueError:
+                time_s = 0.0
+
+            cases_list.append(
+                {
+                    "classname": classname,
+                    "name": name,
+                    "time": time_s,
+                    "status": status,
+                    "message": message,
+                }
+            )
 
     passed_total = max(0, tests_total - failures_total - errors_total - skipped_total)
-    return {
-        "tests": tests_total,
-        "failures": failures_total,
-        "errors": errors_total,
-        "skipped": skipped_total,
-        "passed": passed_total,
-        "cases": cases_list,
-    }
+    summary["tests"] = tests_total
+    summary["failures"] = failures_total
+    summary["errors"] = errors_total
+    summary["skipped"] = skipped_total
+    summary["passed"] = passed_total
+    summary["cases"] = cases_list
+    return summary
 
 
 def run_pytest_in_work(
@@ -545,7 +566,7 @@ def run_pytest_in_work(
     extra_args: list[str] | None = None,
     cap_bytes: int = MAX_OUTPUT_BYTES,
 ) -> dict[str, object]:
-    """Run pytest inside `work_dir` with capped stdout/stderr and JUnit XML output."""
+    """Run pytest inside `work_dir` with capped stdout/stderr and bounded JUnit XML output."""
     junit_dir = Path(tempfile.gettempdir())
     junit_path = junit_dir / "patchpilot_junit.xml"
     if junit_path.exists():
@@ -616,25 +637,35 @@ def run_pytest_in_work(
     stdout_text, stdout_truncated = stdout_box[0]
     stderr_text, stderr_truncated = stderr_box[0]
 
+    # Bounded read of the JUnit file (at most cap_bytes directly)
     junit_xml = ""
     if junit_path.is_file():
         try:
-            raw_xml = junit_path.read_bytes()
-            junit_xml = raw_xml[:cap_bytes].decode("utf-8", errors="replace")
+            with open(junit_path, "rb") as f:
+                raw_xml = f.read(cap_bytes)
+            junit_xml = raw_xml.decode("utf-8", errors="replace")
         except OSError:
             junit_xml = ""
 
+    junit_summary = parse_junit_xml(junit_xml)
+    err = junit_summary.get("error")
+    effective_exit = int(exit_code)
+    if err and effective_exit == 0:
+        effective_exit = 1
+
+    combined_err = (stderr_text + ("\n" if stderr_text else "") + str(err)) if err else stderr_text
+
     return {
-        "exit_code": int(exit_code),
+        "exit_code": effective_exit,
         "patch_applied": True,
         "timed_out": False,
         "stdout": stdout_text,
-        "stderr": stderr_text,
+        "stderr": combined_err,
         "stdout_truncated": stdout_truncated,
         "stderr_truncated": stderr_truncated,
         "junit_xml": junit_xml,
-        "junit": parse_junit_xml(junit_xml),
-        "error": None,
+        "junit": junit_summary,
+        "error": str(err) if err else None,
     }
 
 
@@ -754,7 +785,6 @@ def main(argv: list[str] | None = None) -> int:
         sys.stdout.flush()
         return 3
 
-    # Verify /work itself wasn't turned into a symlink or bad permissions
     if work_dir.is_symlink() or not stat.S_ISDIR(work_dir.stat().st_mode):
         err_result = {
             "exit_code": 2,

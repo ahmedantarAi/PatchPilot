@@ -99,23 +99,30 @@ to exfiltrate secrets, reach the network or LAN, escape the container, fork-bomb
 
 **Execution model.** The host orchestrator launches one fresh container per verification run with
 `docker run --rm`, from the image built from `sandbox/Dockerfile` (toolchain only: no secrets, no
-PatchPilot code; uses a pure-Python runner entrypoint baked into `sandbox/` with no extra `apt-get`
-packages). The repo snapshot and patch are streamed in as a tar on stdin and safely extracted into the
-tmpfs `/work` by the container entrypoint (rejecting path-traversal and symlink escapes; no host bind
-mounts); the unified diff is applied in Python and `pytest` runs inside. The container is removed
-afterwards. Runs are **sequential: at most one sandbox at a time**, enforced by a fail-fast cross-process
-OS file lock + in-process async lock that raises `SandboxBusyError` on concurrent attempts.
+repo code, no test wheels/sdists; uses a pure-Python runner entrypoint baked into `sandbox/` with no extra
+`apt-get` packages). Containers are labelled with `patchpilot.sandbox=1`, and any leftover container with
+this label is removed on orchestrator start. The repo snapshot and patch are streamed in as a tar on stdin and
+safely extracted into the tmpfs `/work` by the container entrypoint (rejecting path-traversal, drive-qualified paths,
+and symlink escapes; no host bind mounts). Case names and file paths cannot inject extra docker run arguments;
+the tar archive is capped at 10,000 members, 32 MB per file, and 200 MB total unpacked size, and patches are capped
+at 10 MB. The unified diff is applied in Python and `pytest` runs inside. The container converts JUnit test results
+to a capped JSON summary (counts, test names, status, max 500 cases) after a bounded read (at most 1 MB) of the XML;
+the host never parses untrusted XML and validates only the JSON summary against a Pydantic schema (`ET.fromstring`
+is forbidden in host code). Hostile XML containing DOCTYPE or entity expansion declarations produces a clean error result.
+The container is removed afterwards. Runs are **sequential: at most one sandbox at a time**, enforced by a fail-fast
+cross-process OS file lock + atomic in-process thread lock that raises `SandboxBusyError` on concurrent attempts.
 
 **Mandatory `docker run` flags / controls:**
 | Control | Setting |
 |---|---|
+| Label | `--label patchpilot.sandbox=1` (all verification and dependency install containers) |
 | Network | `--network none` (no egress, no host/LAN access). Dependencies are pre-baked in the image or installed in a separate, network-enabled **install step** (accepted for v1) that runs no repo code: it mounts a cache volume (`patchpilot-deps-<sha256>`) and runs `pip install --only-binary :all: --no-build-isolation --no-input --target /deps` with only the pinned requirements list present (no repo files, no `setup.py`/build hooks), then mounts `/deps:ro` (`PYTHONPATH=/deps`) into the `--network none` verification container. |
 | Privileges | `--user 10001:10001 --cap-drop ALL --security-opt no-new-privileges`, default seccomp |
 | Filesystem | `--read-only`; writable only `--tmpfs /work:rw,nosuid,size=256m,uid=10001,gid=10001` and `--tmpfs /tmp:rw,noexec,nosuid,size=128m` |
 | Resources | `--memory 768m --memory-swap 768m --cpus 1 --pids-limit 256` |
 | Time | hard wall-clock timeout (default 120 s) enforced by the orchestrator: `docker kill` then `docker rm -f` |
 | Secrets | no `-e` passthrough, no mounted host paths, no Docker socket |
-| Output | stdout/stderr size-capped (1 MB); result returned as structured JSON (exit code, junit XML) |
+| Output | stdout/stderr size-capped (1 MB); result returned as structured JSON (exit code, capped JSON test summary) |
 | Logging | each run records image digest, flags, duration, exit status |
 
 **Rules.** The API/orchestrator process never executes repo code itself. The Docker socket/pipe is
@@ -130,6 +137,11 @@ Upgrade path: gVisor (`runsc`) or a disposable WSL distro/VM.
 
 **Hostile fixtures (acceptance suite; all must be contained):** `network_egress`, `read_host_env`,
 `fork_bomb`, `disk_fill`, `infinite_loop`, `memory_balloon`, `write_outside_work`, `symlink_escape`.
+- `network_egress`: does not depend on the internet; host starts a local TCP listener on `0.0.0.0:0` and container
+  attempts to connect to `host.docker.internal:<port>`. Must fail under `--network none` and succeed when weakened.
+- `memory_balloon`: contained only if exit code is 137/247 or `MemoryError` is observed, not any non-zero exit.
+- `mutation test suite`: tests each control (network, pids-limit, memory, read-only root, user/caps) against
+  deliberately weakened configurations and asserts they report NOT contained.
 
 ## 7. Eval dataset plan
 Goal: measure (a) whether proposed patches are *correct* and (b) whether routing and tracing behave.

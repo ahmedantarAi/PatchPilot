@@ -8,7 +8,6 @@ import os
 import posixpath
 import re
 import tarfile
-import xml.etree.ElementTree as ET
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -17,9 +16,14 @@ from typing import IO
 from pydantic import BaseModel, Field
 
 MAX_OUTPUT_BYTES = 1_048_576  # 1 MB cap per SPEC §6
+MAX_PATCH_BYTES = 10 * 1024 * 1024  # 10 MB maximum patch size
 MAX_TAR_FILE_BYTES = 32 * 1024 * 1024  # 32 MB per single file
 MAX_TAR_TOTAL_BYTES = 200 * 1024 * 1024  # 200 MB total unpacked
 MAX_TAR_MEMBERS = 10_000
+
+MAX_JUNIT_CASES = 500
+MAX_JUNIT_STR_LEN = 1024
+MAX_JUNIT_MSG_LEN = 4096
 
 META_PREFIX = "__patchpilot__/"
 PATCH_MEMBER_NAME = "__patchpilot__/patch.diff"
@@ -37,11 +41,11 @@ class PatchApplyError(ValueError):
 
 
 class JUnitCase(BaseModel):
-    classname: str = ""
-    name: str = ""
+    classname: str = Field(default="", max_length=MAX_JUNIT_STR_LEN)
+    name: str = Field(default="", max_length=MAX_JUNIT_STR_LEN)
     time: float = 0.0
     status: str = "passed"
-    message: str | None = None
+    message: str | None = Field(default=None, max_length=MAX_JUNIT_MSG_LEN)
 
 
 class JUnitReport(BaseModel):
@@ -50,7 +54,7 @@ class JUnitReport(BaseModel):
     errors: int = 0
     skipped: int = 0
     passed: int = 0
-    cases: list[JUnitCase] = Field(default_factory=list)
+    cases: list[JUnitCase] = Field(default_factory=list, max_length=MAX_JUNIT_CASES)
 
 
 @dataclass
@@ -116,7 +120,6 @@ def _walk_repo_no_deref(
         entry_path = Path(entry.path)
         rel_posix = entry_path.relative_to(root_dir).as_posix()
         if entry.is_symlink():
-            # Never dereference host symlinks; record only the link target string
             link_target = os.readlink(entry_path)
             _add_symlink_to_tar(tar, rel_posix, link_target)
         elif entry.is_dir(follow_symlinks=False):
@@ -143,6 +146,9 @@ def build_repo_tar(
     pytest_args: list[str] | None = None,
 ) -> bytes:
     """Build an in-memory tar archive for sandbox stdin without dereferencing host symlinks."""
+    if patch_diff and len(patch_diff.encode("utf-8")) > MAX_PATCH_BYTES:
+        raise ValueError(f"Patch diff size exceeds limit of {MAX_PATCH_BYTES} bytes")
+
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w") as tar:
         if repo_dir is not None:
@@ -248,9 +254,16 @@ def safe_extract_tar(stream: IO[bytes], work_dir: Path) -> ExtractedPayload:
                 if normalized_name == PATCH_MEMBER_NAME:
                     if not member.isreg():
                         raise TarSafetyError("Patch metadata entry must be a regular file")
+                    if member.size > MAX_PATCH_BYTES:
+                        raise TarSafetyError(
+                            f"Patch size {member.size} exceeds {MAX_PATCH_BYTES} limit"
+                        )
                     fobj = tar.extractfile(member)
                     if fobj is not None:
-                        payload.patch_diff = fobj.read(MAX_TAR_FILE_BYTES).decode("utf-8")
+                        data = fobj.read(MAX_PATCH_BYTES + 1)
+                        if len(data) > MAX_PATCH_BYTES:
+                            raise TarSafetyError("Patch exceeded maximum size limit")
+                        payload.patch_diff = data.decode("utf-8")
                     continue
 
                 if normalized_name == META_MEMBER_NAME:
@@ -310,6 +323,8 @@ def parse_unified_diff(diff_text: str, work_dir: Path) -> list[FilePatch]:
     """Parse a unified diff string into structured `FilePatch` objects."""
     if not diff_text.strip():
         return []
+    if len(diff_text.encode("utf-8")) > MAX_PATCH_BYTES:
+        raise PatchApplyError(f"Patch exceeds maximum size of {MAX_PATCH_BYTES} bytes")
 
     raw_lines = diff_text.splitlines()
     idx = 0
@@ -418,6 +433,8 @@ def apply_unified_diff(diff_text: str, work_dir: Path) -> int:
     """Apply a unified diff inside `work_dir` atomically. Returns number of patched files."""
     if not diff_text.strip():
         return 0
+    if len(diff_text.encode("utf-8")) > MAX_PATCH_BYTES:
+        raise PatchApplyError(f"Patch exceeds maximum size of {MAX_PATCH_BYTES} bytes")
 
     try:
         patches = parse_unified_diff(diff_text, work_dir)
@@ -568,66 +585,15 @@ def cap_bytes_output(data: bytes, cap_bytes: int = MAX_OUTPUT_BYTES) -> tuple[st
     return data[:cap_bytes].decode("utf-8", errors="replace"), True
 
 
-def parse_junit_xml(xml_text: str) -> JUnitReport:
-    """Parse pytest JUnit XML into a typed `JUnitReport`."""
-    if not xml_text.strip():
-        return JUnitReport()
-
-    try:
-        root = ET.fromstring(xml_text)
-    except ET.ParseError:
-        return JUnitReport()
-
-    cases_list: list[JUnitCase] = []
-    tests_total = 0
-    failures_total = 0
-    errors_total = 0
-    skipped_total = 0
-
-    for tc in root.findall(".//testcase"):
-        tests_total += 1
-        classname = tc.attrib.get("classname", "")
-        name = tc.attrib.get("name", "")
+def validate_junit_summary(summary_data: object) -> JUnitReport:
+    """Validate a container-produced JSON summary against the Pydantic schema with size limits."""
+    if isinstance(summary_data, JUnitReport):
+        return summary_data
+    if isinstance(summary_data, dict):
         try:
-            time_s = float(tc.attrib.get("time", "0") or "0")
-        except ValueError:
-            time_s = 0.0
-
-        failure_el = tc.find("failure")
-        error_el = tc.find("error")
-        skipped_el = tc.find("skipped")
-
-        status = "passed"
-        message: str | None = None
-        if failure_el is not None:
-            status = "failed"
-            failures_total += 1
-            message = (failure_el.attrib.get("message") or failure_el.text or "")[:4096]
-        elif error_el is not None:
-            status = "error"
-            errors_total += 1
-            message = (error_el.attrib.get("message") or error_el.text or "")[:4096]
-        elif skipped_el is not None:
-            status = "skipped"
-            skipped_total += 1
-            message = (skipped_el.attrib.get("message") or skipped_el.text or "")[:4096]
-
-        cases_list.append(
-            JUnitCase(
-                classname=classname,
-                name=name,
-                time=time_s,
-                status=status,
-                message=message,
-            )
-        )
-
-    passed_total = max(0, tests_total - failures_total - errors_total - skipped_total)
-    return JUnitReport(
-        tests=tests_total,
-        failures=failures_total,
-        errors=errors_total,
-        skipped=skipped_total,
-        passed=passed_total,
-        cases=cases_list,
-    )
+            raw_bytes = json.dumps(summary_data).encode("utf-8")
+            if len(raw_bytes) <= MAX_OUTPUT_BYTES:
+                return JUnitReport.model_validate(summary_data)
+        except Exception:
+            pass
+    return JUnitReport()

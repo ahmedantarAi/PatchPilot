@@ -17,8 +17,7 @@ def test_mock_provider_smoke() -> None:
 
 
 @pytest.mark.parametrize("name", ["ollama", "gemini"])
-def test_real_providers_are_stubs(name: str) -> None:
+def test_real_providers_implement_protocol(name: str) -> None:
     provider = get_provider(name)
-    req = LLMRequest(messages=[Message(role="user", content="x")])
-    with pytest.raises(NotImplementedError):
-        asyncio.run(provider.generate(req))
+    assert isinstance(provider, LLMProvider)
+    assert provider.name == name

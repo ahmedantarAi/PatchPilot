@@ -15,9 +15,23 @@ def get_provider(name: ProviderName | None = None, settings: Settings | None = N
     if chosen == "mock":
         return MockProvider()
     if chosen == "ollama":
-        return OllamaProvider(s.ollama_base_url, s.ollama_model, s.request_timeout_s)
+        return OllamaProvider(
+            s.ollama_base_url,
+            s.ollama_model,
+            s.request_timeout_s,
+            max_attempts=s.max_attempts,
+            retry_base_delay_s=s.retry_base_delay_s,
+            retry_max_delay_s=s.retry_max_delay_s,
+        )
     if chosen == "gemini":
-        return GeminiProvider(s.gemini_api_key, s.gemini_model, s.request_timeout_s)
+        return GeminiProvider(
+            s.gemini_api_key,
+            s.gemini_model,
+            s.request_timeout_s,
+            max_attempts=s.max_attempts,
+            retry_base_delay_s=s.retry_base_delay_s,
+            retry_max_delay_s=s.retry_max_delay_s,
+        )
     raise ValueError(f"unknown provider: {chosen!r}")
 
 

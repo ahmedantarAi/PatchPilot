@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from patchpilot.providers.base import LLMRequest, LLMResponse, Usage
+from patchpilot.providers.base import LLMRequest, LLMResponse, ProviderError, Usage
 
 
 class MockProvider:
@@ -13,6 +13,8 @@ class MockProvider:
         self.calls: list[LLMRequest] = []
 
     async def generate(self, request: LLMRequest) -> LLMResponse:
+        if not request.messages:
+            raise ProviderError("mock: request.messages must not be empty")
         self.calls.append(request)
         prompt_tokens = sum(len(m.content.split()) for m in request.messages)
         return LLMResponse(

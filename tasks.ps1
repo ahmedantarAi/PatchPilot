@@ -10,6 +10,9 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
+if (Test-Path '.venv\Lib\site-packages') {
+    Set-Content -Path '.venv\Lib\site-packages\patchpilot.pth' -Value (Resolve-Path 'src').Path -Encoding ascii
+}
 
 function Invoke-Step {
     param([string]$Exe, [string[]]$Arguments)

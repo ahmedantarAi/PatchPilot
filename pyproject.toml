@@ -27,9 +27,10 @@ package = false  # source is run from src/ via PYTHONPATH; not built as a wheel 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
-addopts = "-m 'not live'"
+addopts = "-m 'not live and not docker'"
 markers = [
     "live: calls live external LLM providers (deselected by default; run with -m live)",
+    "docker: launches sandbox containers via Docker (deselected by default; run with -m docker)",
 ]
 
 [tool.ruff]

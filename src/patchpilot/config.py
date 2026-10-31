@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -48,11 +48,11 @@ class Settings(BaseSettings):
     retry_base_delay_s: float = 0.5
     retry_max_delay_s: float = 8.0
 
-    def __init__(self, *args: object, **kwargs: object) -> None:
-        env_files = kwargs.get("_env_file")
+    def __init__(self, **values: Any) -> None:
+        env_files = values.get("_env_file")
         if env_files is None:
             config_env = self.model_config.get("env_file")
-            targets = (
+            targets: list[object] = (
                 list(config_env)
                 if isinstance(config_env, tuple | list)
                 else [config_env]
@@ -60,17 +60,13 @@ class Settings(BaseSettings):
                 else []
             )
         else:
-            targets = (
-                list(env_files)
-                if isinstance(env_files, tuple | list)
-                else [env_files]
-            )
+            targets = list(env_files) if isinstance(env_files, tuple | list) else [env_files]
 
         for target in targets:
-            if target:
+            if isinstance(target, str | Path):
                 p = Path(target)
                 dups = _find_duplicate_keys(p)
                 if dups:
                     raise ValueError(f"duplicate variable {dups[0]!r} found in {p}")
 
-        super().__init__(*args, **kwargs)
+        super().__init__(**values)

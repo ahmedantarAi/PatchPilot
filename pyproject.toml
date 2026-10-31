@@ -1,0 +1,42 @@
+[project]
+name = "patchpilot"
+version = "0.0.0"
+description = "Autonomous code review and patch verification agent"
+readme = "README.md"
+requires-python = "==3.11.*"
+dependencies = [
+    "fastapi==0.162.0",
+    "uvicorn==0.54.0",
+    "pydantic==2.14.2",
+    "pydantic-settings==2.16.2",
+    "langgraph==1.2.19",
+    "httpx==0.28.1",
+    "langfuse==5.1.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest==9.2.0",
+    "ruff==0.17.3",
+    "mypy==2.4.1",
+]
+
+[tool.uv]
+package = false  # source is run from src/ via PYTHONPATH; not built as a wheel yet
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+mypy_path = "src"

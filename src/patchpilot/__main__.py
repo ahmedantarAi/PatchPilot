@@ -36,8 +36,8 @@ def _resolve_case_dir(case_arg: str) -> Path:
     raise FileNotFoundError(f"Case directory not found for {case_arg!r}")
 
 
-def _load_case_files(case_dir: Path) -> tuple[dict[str, str], str, str]:
-    """Load files, target file name, and known patch from a case directory."""
+def _load_case_files(case_dir: Path) -> dict[str, str]:
+    """Load only the repository files from a case directory (never patch.diff or meta.json)."""
     repo_dir = case_dir / "repo"
     if not repo_dir.is_dir():
         raise FileNotFoundError(f"repo directory not found in {case_dir}")
@@ -48,41 +48,36 @@ def _load_case_files(case_dir: Path) -> tuple[dict[str, str], str, str]:
             rel = str(p.relative_to(repo_dir)).replace("\\", "/")
             files[rel] = p.read_text(encoding="utf-8")
 
-    known_patch = ""
+    return files
+
+
+def load_mock_ground_truth(case_dir: Path) -> str:
+    """Load ground-truth patch exclusively for the MockProvider path."""
     patch_path = case_dir / "patch.diff"
     if patch_path.is_file():
-        known_patch = patch_path.read_text(encoding="utf-8")
+        return patch_path.read_text(encoding="utf-8")
 
-    target_file = ""
     meta_path = case_dir / "meta.json"
     if meta_path.is_file():
         try:
             meta = json.loads(meta_path.read_text(encoding="utf-8"))
             if isinstance(meta, dict) and "patch_diff" in meta:
-                diff_str = str(meta["patch_diff"])
-                for line in diff_str.splitlines():
-                    if line.startswith("--- a/"):
-                        target_file = line[6:].strip()
-                        break
+                return str(meta["patch_diff"])
         except (ValueError, OSError):
             pass
 
-    if not target_file:
-        py_files = [f for f in files if f.endswith(".py") and not Path(f).name.startswith("test_")]
-        if py_files:
-            target_file = py_files[0]
-
-    return files, target_file, known_patch
+    return ""
 
 
 async def _run_command(case_arg: str, provider_name: str) -> int:
     settings = Settings()
     case_dir = _resolve_case_dir(case_arg)
-    files, target_file, known_patch = _load_case_files(case_dir)
+    files = _load_case_files(case_dir)
 
-    # Provider setup
+    # Provider setup: only MockProvider reads ground-truth patch.diff / meta.json
     provider: LLMProvider
     if provider_name == "mock":
+        known_patch = load_mock_ground_truth(case_dir)
         provider = MockProvider(canned=known_patch)
     else:
         provider = get_provider(provider_name, settings)  # type: ignore[arg-type]
@@ -94,31 +89,12 @@ async def _run_command(case_arg: str, provider_name: str) -> int:
         else HashEmbedder(dim=64)
     )
 
-    # Qdrant setup
     qdrant = QdrantStore(base_url="http://127.0.0.1:6333", timeout_s=1.0)
-    try:
-        if await qdrant.is_healthy():
-            await qdrant.ensure_collection("repo_code", dim=64)
-            points = []
-            non_test_files = [
-                (p, c)
-                for p, c in files.items()
-                if p.endswith(".py") and not Path(p).name.startswith("test_")
-            ]
-            if non_test_files:
-                texts = [f"{p}:\n{c}" for p, c in non_test_files]
-                vecs = await embedder.embed(texts)
-                for i, ((p, c), v) in enumerate(zip(non_test_files, vecs, strict=True)):
-                    points.append({"id": i + 1, "vector": v, "payload": {"file": p, "text": c}})
-                await qdrant.upsert("repo_code", points)
-    except Exception as exc:
-        logger.info("Qdrant indexing failed or degraded: %s", exc)
 
     initial_state = PipelineState(
         case_id=case_arg,
         files=files,
-        target_file=target_file,
-        data_class="public",  # Seeded eval cases are public per SPEC §9 and Req 5
+        data_class="public",
         provider=provider_name,
     )
 

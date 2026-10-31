@@ -4,13 +4,26 @@ from __future__ import annotations
 
 import hashlib
 import logging
+from collections.abc import Mapping
 from typing import Any, Protocol, runtime_checkable
 
 import httpx
 
+from patchpilot.pipeline.normalization import is_modifiable_py_file
 from patchpilot.providers.base import ProviderError
 
 logger = logging.getLogger("patchpilot.retrieval")
+
+
+def case_collection_name(files: Mapping[str, str]) -> str:
+    """Derive a per-case Qdrant collection name from the case content hash."""
+    hasher = hashlib.sha256()
+    for path in sorted(files):
+        hasher.update(path.replace("\\", "/").encode("utf-8"))
+        hasher.update(b"\x00")
+        hasher.update(files[path].encode("utf-8"))
+        hasher.update(b"\x00")
+    return f"patchpilot_case_{hasher.hexdigest()[:16]}"
 
 
 @runtime_checkable
@@ -154,6 +167,26 @@ class QdrantStore:
             logger.warning("Failed to ensure Qdrant collection %r: %s", collection_name, exc)
             return False
 
+    async def recreate_collection(self, collection_name: str, dim: int = 64) -> bool:
+        """Delete the collection if it exists and create a fresh one with dimension `dim`."""
+        url = f"{self.base_url}/collections/{collection_name}"
+        try:
+            async with httpx.AsyncClient(
+                timeout=self.timeout_s, transport=self._transport
+            ) as client:
+                await client.delete(url)
+                payload = {
+                    "vectors": {
+                        "size": dim,
+                        "distance": "Cosine",
+                    }
+                }
+                res = await client.put(url, json=payload)
+                return res.status_code == 200
+        except (httpx.HTTPError, OSError) as exc:
+            logger.warning("Failed to recreate Qdrant collection %r: %s", collection_name, exc)
+            return False
+
     async def upsert(
         self,
         collection_name: str,
@@ -214,3 +247,30 @@ class QdrantStore:
         except (httpx.HTTPError, OSError) as exc:
             logger.warning("Failed to delete Qdrant collection %r: %s", collection_name, exc)
             return False
+
+    async def index_case_files(
+        self,
+        files: Mapping[str, str],
+        embedder: Embedder,
+    ) -> str | None:
+        """Recreate the per-case collection from the case content hash and index .py files."""
+        if not await self.is_healthy():
+            return None
+
+        col_name = case_collection_name(files)
+        non_test_files = [(p, c) for p, c in sorted(files.items()) if is_modifiable_py_file(p)]
+        if not non_test_files:
+            await self.recreate_collection(col_name, dim=64)
+            return col_name
+
+        texts = [f"{p}:\n{c}" for p, c in non_test_files]
+        vecs = await embedder.embed(texts)
+        dim = len(vecs[0]) if vecs and vecs[0] else 64
+        if not await self.recreate_collection(col_name, dim=dim):
+            return None
+
+        points: list[dict[str, Any]] = []
+        for i, ((p, c), v) in enumerate(zip(non_test_files, vecs, strict=True)):
+            points.append({"id": i + 1, "vector": v, "payload": {"file": p, "text": c}})
+        await self.upsert(col_name, points)
+        return col_name

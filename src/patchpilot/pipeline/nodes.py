@@ -13,9 +13,14 @@ from pathlib import Path
 from typing import Any, Literal
 
 from patchpilot.pipeline.models import Finding, PipelineState
-from patchpilot.pipeline.normalization import normalize_patch
+from patchpilot.pipeline.normalization import (
+    is_modifiable_py_file,
+    is_test_file,
+    normalize_patch,
+    validate_patch_targets,
+)
 from patchpilot.providers.base import LLMProvider, LLMRequest, Message, ProviderError
-from patchpilot.retrieval import Embedder, QdrantStore
+from patchpilot.retrieval import Embedder, QdrantStore, case_collection_name
 from patchpilot.sandbox.runner import SandboxResult, SandboxRunner
 
 logger = logging.getLogger("patchpilot.pipeline")
@@ -119,19 +124,36 @@ async def run_llm_diff_analysis(
     provider: LLMProvider,
     data_class: Any,
     findings: list[Finding],
-    target_file: str = "",
+    failing_test_output: str = "",
     retrieved_context: list[str] | None = None,
 ) -> list[Finding]:
-    """Perform LLM diff and fault inspection producing typed Finding objects."""
+    """Perform LLM fault localization and inspection without ground-truth file hints."""
+    non_test_py_files = [p for p in sorted(files) if is_modifiable_py_file(p)]
+    test_files = [p for p in sorted(files) if is_test_file(p)]
+
     prompt_lines = [
-        "You are PatchPilot static analysis and diff inspection engine.",
-        "Inspect the provided repository files and existing static findings to identify bugs.",
-        "Emits findings as lines in format: FINDING: <file>:<line>: <category>: <explanation>",
+        "You are PatchPilot static analysis and fault localization engine.",
+        (
+            "Localize the fault across the repository's non-test Python files using "
+            "the failing test output and file contents."
+        ),
+        "For multi-file repositories, choose the non-test .py file that contains the defect.",
+        "Emit findings as lines in format: FINDING: <file>:<line>: <category>: <explanation>",
     ]
-    if target_file:
-        prompt_lines.append(f"Primary target file: {target_file}")
+    if non_test_py_files:
+        prompt_lines.append("Repository non-test .py files:")
+        for p in non_test_py_files:
+            prompt_lines.append(f"- {p}")
+    if failing_test_output:
+        prompt_lines.append("Failing test output:")
+        prompt_lines.append(failing_test_output)
+    if test_files:
+        prompt_lines.append("Failing test content:")
+        for p in test_files:
+            prompt_lines.append(f"--- Test File: {p} ---")
+            prompt_lines.append(files[p])
     if findings:
-        prompt_lines.append("Initial linter findings:")
+        prompt_lines.append("Initial static analysis findings:")
         for f in findings:
             prompt_lines.append(f"- {f.file}:{f.line} [{f.category}] {f.explanation}")
     if retrieved_context:
@@ -139,10 +161,10 @@ async def run_llm_diff_analysis(
         for ctx in retrieved_context:
             prompt_lines.append(ctx)
 
-    prompt_lines.append("Files:")
-    for path, content in sorted(files.items()):
+    prompt_lines.append("Repository non-test .py file contents:")
+    for path in non_test_py_files:
         prompt_lines.append(f"--- File: {path} ---")
-        prompt_lines.append(content)
+        prompt_lines.append(files[path])
 
     req = LLMRequest(
         messages=[Message(role="user", content="\n".join(prompt_lines))],
@@ -171,10 +193,16 @@ async def run_llm_diff_analysis(
                     except ValueError:
                         pass
         if not llm_findings and resp.text.strip() and resp.text != "MOCK_RESPONSE":
-            target = target_file or next(iter(files.keys()), "unknown")
+            chosen_file = "unknown"
+            for candidate in non_test_py_files:
+                if candidate in resp.text:
+                    chosen_file = candidate
+                    break
+            if chosen_file == "unknown" and non_test_py_files:
+                chosen_file = non_test_py_files[0]
             llm_findings.append(
                 Finding(
-                    file=target,
+                    file=chosen_file,
                     line=1,
                     category="llm_diff_inspection",
                     explanation=resp.text.strip().splitlines()[0][:200],
@@ -191,6 +219,7 @@ def create_analyze_node(
     provider: LLMProvider,
     qdrant: QdrantStore | None = None,
     embedder: Embedder | None = None,
+    sandbox_runner: SandboxRunner | None = None,
 ) -> Callable[[PipelineState], Awaitable[dict[str, Any]]]:
     """Create the analyze node pure function over PipelineState."""
 
@@ -203,32 +232,57 @@ def create_analyze_node(
 
         all_findings = ast_findings + ruff_findings
 
-        # 3. Retrieval from Qdrant if available
+        # 3. Failing test output (never running untrusted code on the host per SPEC §6)
+        failing_test_output = state.failing_test_output
+        if not failing_test_output and sandbox_runner is not None:
+            try:
+                init_res = await sandbox_runner.run(
+                    files=state.files,
+                    patch_diff="",
+                    pytest_args=["-q"],
+                )
+                failing_test_output = f"{init_res.stdout}\n{init_res.stderr}".strip()
+            except Exception as exc:
+                logger.info("Initial sandbox test run skipped or failed in analyze: %s", exc)
+
+        if not failing_test_output:
+            test_snippets = [
+                f"{p}:\n{c}" for p, c in sorted(state.files.items()) if is_test_file(p)
+            ]
+            failing_test_output = "\n".join(test_snippets)
+
+        # 4. Retrieval from Qdrant per-case collection if available
         retrieved_context: list[str] = []
         if qdrant is not None and embedder is not None:
             try:
                 healthy = await qdrant.is_healthy()
                 if healthy:
-                    query_text = f"{state.target_file}\n" + "\n".join(
-                        f"{f.file}:{f.category}" for f in all_findings
+                    col_name = case_collection_name(state.files)
+                    non_test_list = "\n".join(
+                        p for p in sorted(state.files) if is_modifiable_py_file(p)
                     )
-                    query_vecs = await embedder.embed([query_text])
-                    if query_vecs:
-                        hits = await qdrant.search("repo_code", query_vecs[0], limit=3)
-                        for hit in hits:
-                            payload = hit.get("payload")
-                            if isinstance(payload, dict) and "text" in payload:
-                                retrieved_context.append(str(payload["text"]))
+                    findings_text = "\n".join(
+                        f"{f.file}:{f.category}:{f.explanation}" for f in all_findings
+                    )
+                    query_text = f"{non_test_list}\n{failing_test_output}\n{findings_text}".strip()
+                    if query_text:
+                        query_vecs = await embedder.embed([query_text])
+                        if query_vecs:
+                            hits = await qdrant.search(col_name, query_vecs[0], limit=3)
+                            for hit in hits:
+                                payload = hit.get("payload")
+                                if isinstance(payload, dict) and "text" in payload:
+                                    retrieved_context.append(str(payload["text"]))
             except Exception as exc:
                 logger.info("Qdrant retrieval degraded gracefully during analyze: %s", exc)
 
-        # 4. LLM diff analysis
+        # 5. LLM fault localization and diff analysis
         llm_findings = await run_llm_diff_analysis(
             files=state.files,
             provider=provider,
             data_class=state.data_class,
             findings=all_findings,
-            target_file=state.target_file,
+            failing_test_output=failing_test_output,
             retrieved_context=retrieved_context,
         )
         combined_findings = all_findings + llm_findings
@@ -236,6 +290,7 @@ def create_analyze_node(
         return {
             "findings": combined_findings,
             "retrieved_context": retrieved_context,
+            "failing_test_output": failing_test_output,
         }
 
     return analyze_node
@@ -247,19 +302,30 @@ def create_propose_node(
     """Create the propose node pure function over PipelineState."""
 
     async def propose_node(state: PipelineState) -> dict[str, Any]:
+        non_test_py_files = [p for p in sorted(state.files) if is_modifiable_py_file(p)]
+
         prompt_parts = [
             "You are PatchPilot, an autonomous automated code repair agent.",
-            "Fix the bug in the repository so that all tests pass.",
+            "Fix the bug in the repository's non-test .py file(s) so that all tests pass.",
+            (
+                "Never modify test files (test_*.py, *_test.py, anything under tests/, "
+                "conftest.py) or non-.py files."
+            ),
             "Provide your fix as SEARCH/REPLACE blocks formatted as:",
-            "<<<<<<< SEARCH",
+            "<<<<<<< SEARCH:<path/to/file.py>",
             "<exact original lines to replace>",
             "=======",
             "<replacement lines>",
             ">>>>>>> REPLACE",
             "(A raw unified diff is also accepted.)",
         ]
-        if state.target_file:
-            prompt_parts.append(f"Target file: {state.target_file}")
+        if non_test_py_files:
+            prompt_parts.append("Candidate non-test .py files:")
+            for p in non_test_py_files:
+                prompt_parts.append(f"- {p}")
+        if state.failing_test_output:
+            prompt_parts.append("Failing test output:")
+            prompt_parts.append(state.failing_test_output)
         if state.findings:
             prompt_parts.append("Identified findings:")
             for f in state.findings:
@@ -271,7 +337,7 @@ def create_propose_node(
         if state.feedback:
             prompt_parts.append("PREVIOUS ATTEMPT FAILED WITH TEST OUTPUT / ERROR:")
             prompt_parts.append(state.feedback)
-            prompt_parts.append("Please analyze the test failure and adjust your fix accordingly.")
+            prompt_parts.append("Please analyze the failure and adjust your fix accordingly.")
 
         prompt_parts.append("Repository files:")
         for path, content in sorted(state.files.items()):
@@ -296,11 +362,7 @@ def create_propose_node(
             }
 
         try:
-            canonical_diff = normalize_patch(
-                raw_patch,
-                state.files,
-                default_file=state.target_file,
-            )
+            canonical_diff = normalize_patch(raw_patch, state.files)
             return {
                 "raw_patch": raw_patch,
                 "patch_diff": canonical_diff,
@@ -327,6 +389,7 @@ def create_verify_node(
         attempt = state.attempt + 1
 
         if not state.patch_diff.strip():
+            reason = state.error or "No patch proposed or patch could not be normalized."
             return {
                 "attempt": attempt,
                 "patch_applies": False,
@@ -335,7 +398,22 @@ def create_verify_node(
                 "verified": False,
                 "pass_at_1": False if attempt == 1 else state.pass_at_1,
                 "pass_at_k": False if attempt >= state.max_attempts else state.pass_at_k,
-                "feedback": state.error or "No patch proposed or patch could not be normalized.",
+                "feedback": f"Attempt {attempt} failed before sandbox execution: {reason}",
+            }
+
+        # Defense in depth: enforce reward-hacking guard again inside verify before sandbox run
+        try:
+            validate_patch_targets(state.patch_diff)
+        except ValueError as exc:
+            return {
+                "attempt": attempt,
+                "patch_applies": False,
+                "target_test_passes": False,
+                "regressions": 0,
+                "verified": False,
+                "pass_at_1": False if attempt == 1 else state.pass_at_1,
+                "pass_at_k": False if attempt >= state.max_attempts else state.pass_at_k,
+                "feedback": f"Attempt {attempt} rejected by verify reward-hacking guard: {exc}",
             }
 
         # Run verification in sandbox

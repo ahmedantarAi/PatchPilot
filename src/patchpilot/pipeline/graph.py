@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any, cast
 
 from langgraph.graph import END, StateGraph
@@ -17,8 +18,10 @@ from patchpilot.pipeline.nodes import (
     should_retry,
 )
 from patchpilot.providers.base import LLMProvider
-from patchpilot.retrieval import Embedder, QdrantStore
+from patchpilot.retrieval import Embedder, QdrantStore, case_collection_name
 from patchpilot.sandbox.runner import SandboxRunner
+
+logger = logging.getLogger("patchpilot.pipeline")
 
 
 def build_pipeline_graph(
@@ -31,7 +34,12 @@ def build_pipeline_graph(
     """Build and compile the LangGraph state machine for PatchPilot."""
     builder: Any = StateGraph(PipelineState)
 
-    analyze_node = create_analyze_node(provider=provider, qdrant=qdrant, embedder=embedder)
+    analyze_node = create_analyze_node(
+        provider=provider,
+        qdrant=qdrant,
+        embedder=embedder,
+        sandbox_runner=sandbox_runner,
+    )
     propose_node = create_propose_node(provider=provider)
     verify_node = create_verify_node(sandbox_runner=sandbox_runner, verify_fn=verify_fn)
 
@@ -65,6 +73,13 @@ async def run_pipeline(
     embedder: Embedder | None = None,
 ) -> PipelineState:
     """Execute the pipeline state machine to completion and return final PipelineState."""
+    col_name = case_collection_name(initial_state.files)
+    if qdrant is not None and embedder is not None:
+        try:
+            await qdrant.index_case_files(initial_state.files, embedder)
+        except Exception as exc:
+            logger.info("Qdrant per-case indexing failed or degraded: %s", exc)
+
     graph = build_pipeline_graph(
         provider=provider,
         sandbox_runner=sandbox_runner,
@@ -72,5 +87,13 @@ async def run_pipeline(
         qdrant=qdrant,
         embedder=embedder,
     )
-    result_dict = await graph.ainvoke(initial_state)
-    return PipelineState.model_validate(result_dict)
+    try:
+        result_dict = await graph.ainvoke(initial_state)
+        return PipelineState.model_validate(result_dict)
+    finally:
+        if qdrant is not None and embedder is not None:
+            try:
+                if await qdrant.is_healthy():
+                    await qdrant.delete_collection(col_name)
+            except Exception as exc:
+                logger.info("Qdrant per-case collection cleanup degraded: %s", exc)

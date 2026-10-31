@@ -22,7 +22,7 @@ class PipelineState(BaseModel):
 
     case_id: str
     files: dict[str, str] = Field(default_factory=dict)
-    target_file: str = ""
+    failing_test_output: str = ""
     findings: list[Finding] = Field(default_factory=list)
     retrieved_context: list[str] = Field(default_factory=list)
     raw_patch: str = ""
@@ -40,6 +40,11 @@ class PipelineState(BaseModel):
     provider: str = "mock"
     data_class: DataClass = "private"
     reported_patch: str = ""
+    tokens: dict[str, int] = Field(
+        default_factory=lambda: {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    )
+    llm_latencies: list[float] = Field(default_factory=list)
+    model_name: str = ""
 
 
 class PipelineRunSummary(BaseModel):

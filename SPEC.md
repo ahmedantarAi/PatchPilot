@@ -32,15 +32,22 @@ HOST (Windows, `uv run`)                                   DOCKER (Compose)
 - **Pipeline nodes and state machine (`analyze → propose ⇄ verify → report`):**
   - **`analyze`:** Runs Python stdlib `ast.parse` and `ruff check --output-format json --isolated --no-config`
     (never loading target-repo configuration files on the host), retrieves relevant repository context from
-    Qdrant (§5) when available, and performs LLM diff/fault inspection. Emits typed `Finding` objects
+    a per-case Qdrant collection (§5) when available, and performs LLM fault localization and diff inspection.
+    Receives only the repository file list (non-test `.py` files), the failing test output, and file contents —
+    never the ground-truth answer (`target_file` does not exist in `PipelineState` or in any prompt; for
+    multi-file repositories, the model chooses the file itself). Emits typed `Finding` objects
     (`file`, `line`, `category`, `explanation`, `fixable`). Used directly by `findings_eval` (PR review
     mode) and feeds fixable findings / failing test context into `propose`.
   - **`propose`:** Prompts the LLM for `SEARCH/REPLACE` blocks (while also accepting raw unified diffs, e.g.
     from `MockProvider` or reference patches) and normalizes the result on the host via `difflib.unified_diff`
-    against the target snapshot file so hunk headers and line counts are always canonical.
-  - **`verify`:** Applies the canonical unified diff and runs the test suite inside the hardened sandbox (§6).
-    If patch application or tests fail and `attempt < max_attempts` (fixed `k = 3`), a conditional edge loops
-    back to `propose` with structured error/test-failure feedback. Attempt 1 records `pass@1`; succeeding
+    against the repository snapshot without any ground-truth `default_file` hint. Enforces the
+    **reward-hacking guard** at normalization time: any patch that touches a test file (`test_*.py`,
+    `*_test.py`, anything under `tests/`, `conftest.py`) or any non-`.py` file is rejected.
+  - **`verify`:** Enforces the **reward-hacking guard** again (defense in depth) before launching the
+    sandbox, then applies the canonical unified diff and runs the test suite inside the hardened sandbox (§6).
+    A rejected patch (or a patch that fails application or tests) counts as a failed attempt with a clear
+    rejection/failure reason fed back to `propose` while `attempt < max_attempts` (fixed `k = 3`). A patch
+    that edits an assertion can never produce `verified = True`. Attempt 1 records `pass@1`; succeeding
     within `≤ 3` attempts records `pass@3`.
   - **`report`:** Emits structured findings and only patches that achieved `verified = True` (`patch_applies`,
     `target_test_passes`, and `regressions == 0`).
@@ -80,8 +87,10 @@ Never expose it to the sandbox network.
 **Qdrant** (core, no profile): vector store for repository code retrieval. Bound to 127.0.0.1:6333.
 Accessed via plain `httpx` against Qdrant's REST API (no extra SDK dependency). Embeddings go through an
 `Embedder` protocol: `OllamaEmbedder` (`POST /api/embed`) in live mode and a deterministic hashed-token
-`HashEmbedder` in `mock`/CI mode so retrieval tests never call external models. Pipeline must degrade
-gracefully (no retrieval) if Qdrant is down.
+`HashEmbedder` in `mock`/CI mode so retrieval tests never call external models. Each case uses an isolated
+per-case collection named from the case content hash (`patchpilot_case_<sha256[:16]>`), recreated before
+indexing and deleted after the run so retrieval for case B never returns chunks from case A. Pipeline must
+degrade gracefully (no retrieval) if Qdrant is down.
 
 **Langfuse v4** (profile `observability` only): 6 containers (web, worker, ClickHouse, Postgres, Redis,
 MinIO). This is the minimum official topology; there is no lighter self-hosted variant. Core code never
@@ -185,6 +194,16 @@ each case's verification result keyed by a hash of the case contents and the san
   or mutation signature matches an eval case is dropped. `evals verify` fails if any overlap exists.
 - `realworld_eval`, `findings_eval` and `safety` are eval-only; they are never used for training or
   prompt tuning.
+- **Ground-truth isolation:** Real providers (`ollama`, `gemini`) never cause `patch.diff` or `meta.json`
+  to be read by the pipeline. Only the `MockProvider` path (via a dedicated `load_mock_ground_truth`
+  function) and test assertions may read `patch.diff` or `meta.json`. No prompt may contain ground-truth
+  fix hunks, `patch.diff` content, or a `meta.json` target file hint (unless the filename legitimately
+  appears in the failing test output).
+- **Reward-hacking guard & Qdrant per-case isolation:** Any patch touching a test file (`test_*.py`,
+  `*_test.py`, anything under `tests/`, `conftest.py`) or any non-`.py` file is rejected at both
+  normalization time and inside `verify` (defense in depth), counting as a failed attempt with the reason
+  fed back to `propose`. Each case indexes into a per-case Qdrant collection named from its content hash
+  and deletes the collection after the run.
 
 **Freeze.** The eval split (all eval-only pools) is **frozen before any tuning, prompt iteration or
 training starts**: `evals freeze` writes `evals/FROZEN.json` (case ids, per-case content hashes, generator
@@ -227,6 +246,10 @@ plumbing, never model quality.
 - `.env` is gitignored; `.env.example` holds placeholders. Langfuse telemetry disabled.
   Traces may contain code: Langfuse is local-only and not exposed beyond 127.0.0.1.
 - All Compose ports bind to 127.0.0.1. No secret ever enters the sandbox.
+- **Ground-truth and test-integrity isolation:** Real providers (`ollama`, `gemini`) never read `patch.diff`
+  or `meta.json`, and `target_file` is never stored in pipeline state or prompts. Untrusted patches are
+  blocked from modifying test files (`test_*.py`, `*_test.py`, `tests/**`, `conftest.py`) or non-`.py` files
+  at both normalization time and verification time.
 
 ## 10. Definition of done for the scaffold
 `.\tasks.ps1 check` and `.\tasks.ps1 config` pass; `docker compose config` validates with and without

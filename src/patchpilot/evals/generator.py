@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 from pathlib import Path
 
 from patchpilot.evals.models import BugTaxonomy, CaseDefinition, CaseMetadata, SplitManifest
 from patchpilot.evals.taxonomy import (
-    TAXONOMY_TEMPLATE_GENERATORS,
+    EVAL_TEMPLATES_PER_CLASS,
+    TRAIN_TEMPLATES_PER_CLASS,
     build_seeded_case,
     compute_case_content_hash,
     compute_source_hash,
@@ -16,20 +18,22 @@ from patchpilot.evals.taxonomy import (
 from patchpilot.sandbox.fixtures import HOSTILE_FIXTURES
 
 
-def _round_robin_targets(total_cases: int) -> list[tuple[BugTaxonomy, str]]:
+def _round_robin_targets(
+    total_cases: int,
+    template_map: dict[BugTaxonomy, list[str]],
+) -> list[tuple[BugTaxonomy, str]]:
     """Generate balanced sequence of (taxonomy, template) pairs for target size."""
     taxonomies = list(BugTaxonomy)
-    tax_templates: dict[BugTaxonomy, list[str]] = {}
-    for tax, tpl in TAXONOMY_TEMPLATE_GENERATORS:
-        tax_templates.setdefault(tax, []).append(tpl)
-
     pairs: list[tuple[BugTaxonomy, str]] = []
     tax_idx = 0
     tpl_indices = {tax: 0 for tax in taxonomies}
 
     while len(pairs) < total_cases:
         tax = taxonomies[tax_idx % len(taxonomies)]
-        tpl_list = tax_templates[tax]
+        tpl_list = template_map.get(tax, [])
+        if not tpl_list:
+            tax_idx += 1
+            continue
         t_idx = tpl_indices[tax] % len(tpl_list)
         tpl = tpl_list[t_idx]
         tpl_indices[tax] += 1
@@ -40,8 +44,8 @@ def _round_robin_targets(total_cases: int) -> list[tuple[BugTaxonomy, str]]:
 
 
 def generate_seeded_eval(base_seed: int = 1337, count: int = 120) -> list[CaseDefinition]:
-    """Deterministically generate the eval dataset pool (seeded_eval)."""
-    pairs = _round_robin_targets(count)
+    """Deterministically generate the seeded_eval pool using reserved eval templates."""
+    pairs = _round_robin_targets(count, EVAL_TEMPLATES_PER_CLASS)
     cases: list[CaseDefinition] = []
 
     for idx, (tax, tpl) in enumerate(pairs, start=1):
@@ -80,7 +84,10 @@ def generate_seeded_train(
     }
     eval_signatures = {c.metadata.mutation_signature for c in eval_cases}
 
-    pairs = _round_robin_targets(count)
+    # Template rejection set: eval templates are strictly prohibited in train
+    reserved_eval_templates = {tpl for tpls in EVAL_TEMPLATES_PER_CLASS.values() for tpl in tpls}
+
+    pairs = _round_robin_targets(count, TRAIN_TEMPLATES_PER_CLASS)
     cases: list[CaseDefinition] = []
     seen_train_content_hashes: set[str] = set()
 
@@ -89,6 +96,11 @@ def generate_seeded_train(
     candidate_step = 0
 
     for idx, (tax, tpl) in enumerate(pairs, start=1):
+        if tpl in reserved_eval_templates:
+            raise ValueError(
+                f"Template {tpl} is reserved for seeded_eval and cannot be used in seeded_train"
+            )
+
         case_id = f"{idx:04d}"
         while True:
             candidate_step += 1
@@ -159,6 +171,8 @@ def generate_safety_cases() -> list[CaseDefinition]:
 def materialize_case(case: CaseDefinition, target_dir: Path) -> Path:
     """Write a case definition to disk under target_dir/<pool>/<case_id>/."""
     case_dir = target_dir / case.metadata.pool / case.metadata.case_id
+    if case_dir.exists():
+        shutil.rmtree(case_dir)
     repo_dir = case_dir / "repo"
     repo_dir.mkdir(parents=True, exist_ok=True)
 
@@ -258,6 +272,9 @@ def build_and_materialize_all(
     safety_hashes = [c.metadata.content_hash for c in safety_cases]
 
     overlap = len(set(eval_hashes).intersection(set(train_hashes)))
+    eval_templates = {c.metadata.template for c in eval_cases}
+    train_templates = {c.metadata.template for c in train_cases}
+    template_overlap = len(eval_templates.intersection(train_templates))
 
     split_manifest = SplitManifest(
         generator_version="1.0.0",
@@ -269,6 +286,9 @@ def build_and_materialize_all(
         seeded_train_hashes=train_hashes,
         safety_hashes=safety_hashes,
         overlap_count=overlap,
+        eval_template_count=len(eval_templates),
+        train_template_count=len(train_templates),
+        template_overlap_count=template_overlap,
     )
 
     manifest_path = datasets_dir / "split_manifest.json"

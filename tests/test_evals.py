@@ -15,7 +15,11 @@ from patchpilot.evals.generator import (
 )
 from patchpilot.evals.taxonomy import (
     BASE_TEMPLATES,
+    EVAL_TEMPLATES_PER_CLASS,
+    TRAIN_TEMPLATES_PER_CLASS,
+    get_eval_templates_per_class,
     get_template_distribution,
+    get_train_templates_per_class,
 )
 from patchpilot.evals.verifier import run_verify
 
@@ -35,15 +39,68 @@ def test_generator_determinism() -> None:
 
 
 def test_taxonomy_and_template_coverage() -> None:
-    """At least 8 distinct base templates and at least 2 unique templates per taxonomy class."""
-    assert len(BASE_TEMPLATES) >= 8
+    """At least 8 distinct base templates per taxonomy class (56 total across 7 classes)."""
+    assert len(BASE_TEMPLATES) >= 56
 
     distribution = get_template_distribution()
     assert len(distribution) == 7  # 7 SPEC §7 classes
 
     for tax_name, tpls in distribution.items():
-        assert len(tpls) >= 2, f"Taxonomy {tax_name} has insufficient templates: {tpls}"
+        assert len(tpls) >= 8, f"Taxonomy {tax_name} has fewer than 8 templates: {len(tpls)}"
         assert len(set(tpls)) == len(tpls), f"Duplicate templates registered for {tax_name}"
+
+
+def test_template_split_disjoint_and_counts() -> None:
+    """reserve about 25% of templates per class for seeded_eval ONLY; train must never use them."""
+    eval_dist = get_eval_templates_per_class()
+    train_dist = get_train_templates_per_class()
+
+    assert len(eval_dist) == 7
+    assert len(train_dist) == 7
+    assert len(EVAL_TEMPLATES_PER_CLASS) == 7
+    assert len(TRAIN_TEMPLATES_PER_CLASS) == 7
+
+    total_eval_tpls = 0
+    total_train_tpls = 0
+
+    all_eval_set: set[str] = set()
+    all_train_set: set[str] = set()
+
+    for tax in eval_dist:
+        eval_tpls = set(eval_dist[tax])
+        train_tpls = set(train_dist[tax])
+
+        # Exactly 2 eval (25%) and 6 train (75%)
+        assert len(eval_tpls) == 2, f"Expected 2 eval templates for {tax}, got {len(eval_tpls)}"
+        assert len(train_tpls) == 6, f"Expected 6 train templates for {tax}, got {len(train_tpls)}"
+
+        # Strict disjointness per class
+        overlap = eval_tpls.intersection(train_tpls)
+        assert len(overlap) == 0, f"Template overlap in taxonomy {tax}: {overlap}"
+
+        total_eval_tpls += len(eval_tpls)
+        total_train_tpls += len(train_tpls)
+        all_eval_set.update(eval_tpls)
+        all_train_set.update(train_tpls)
+
+    assert total_eval_tpls == 14
+    assert total_train_tpls == 42
+    assert len(all_eval_set.intersection(all_train_set)) == 0
+
+    # Test actual pool generation enforces disjointness
+    eval_cases = generate_seeded_eval(base_seed=1337, count=120)
+    train_cases = generate_seeded_train(base_seed=1337, count=360, eval_cases=eval_cases)
+
+    used_eval_templates = {c.metadata.template for c in eval_cases}
+    used_train_templates = {c.metadata.template for c in train_cases}
+
+    assert used_eval_templates.issubset(all_eval_set)
+    assert used_train_templates.issubset(all_train_set)
+
+    pool_template_overlap = used_eval_templates.intersection(used_train_templates)
+    assert len(pool_template_overlap) == 0, (
+        f"Templates appeared in both eval and train pools: {pool_template_overlap}"
+    )
 
 
 def test_train_eval_split_zero_overlap() -> None:

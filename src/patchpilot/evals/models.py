@@ -86,3 +86,6 @@ class SplitManifest(BaseModel):
     seeded_train_hashes: list[str]
     safety_hashes: list[str]
     overlap_count: int = 0
+    eval_template_count: int = 14
+    train_template_count: int = 42
+    template_overlap_count: int = 0

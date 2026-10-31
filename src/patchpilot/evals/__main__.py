@@ -8,7 +8,12 @@ from pathlib import Path
 
 from patchpilot.evals.freeze import freeze_eval_split, verify_frozen_eval_split
 from patchpilot.evals.generator import build_and_materialize_all
-from patchpilot.evals.taxonomy import BASE_TEMPLATES, get_template_distribution
+from patchpilot.evals.taxonomy import (
+    BASE_TEMPLATES,
+    get_eval_templates_per_class,
+    get_template_distribution,
+    get_train_templates_per_class,
+)
 from patchpilot.evals.verifier import run_verify
 
 DEFAULT_DATASETS_DIR = Path("evals/datasets")
@@ -26,6 +31,19 @@ def cmd_build(args: argparse.Namespace) -> int:
         print(f"  {tax_name}: {len(tpls)} unique templates ({', '.join(tpls)})")
     print(f"Total unique base templates: {len(BASE_TEMPLATES)}")
 
+    eval_tpls = get_eval_templates_per_class()
+    train_tpls = get_train_templates_per_class()
+    total_eval_tpls = sum(len(tpls) for tpls in eval_tpls.values())
+    total_train_tpls = sum(len(tpls) for tpls in train_tpls.values())
+
+    print("\nTemplate split per pool (eval-reserved vs train-reserved):")
+    print(f"  seeded_eval templates : {total_eval_tpls} (25% split, 2 per class)")
+    for tax_name, tpls in sorted(eval_tpls.items()):
+        print(f"    {tax_name}: {len(tpls)} templates ({', '.join(tpls)})")
+    print(f"  seeded_train templates: {total_train_tpls} (75% split, 6 per class)")
+    for tax_name, tpls in sorted(train_tpls.items()):
+        print(f"    {tax_name}: {len(tpls)} templates ({', '.join(tpls)})")
+
     manifest = build_and_materialize_all(
         base_seed=seed,
         datasets_dir=datasets_dir,
@@ -34,9 +52,10 @@ def cmd_build(args: argparse.Namespace) -> int:
     )
 
     print(
-        f"built seeded_eval={manifest.seeded_eval_count} "
+        f"\nbuilt seeded_eval={manifest.seeded_eval_count} "
         f"seeded_train={manifest.seeded_train_count} "
-        f"safety={manifest.safety_count}"
+        f"safety={manifest.safety_count} "
+        f"(overlap={manifest.overlap_count}, template_overlap={manifest.template_overlap_count})"
     )
     return 0
 

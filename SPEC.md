@@ -167,17 +167,22 @@ missing or non-allowlisted license.
 
 Each seeded case = repo snapshot + failing test + known-good fix, produced by a generator over a bug
 taxonomy (off-by-one, wrong operator, None handling, missing await, resource leak, mutable default arg,
-string-built SQL). Generation is deterministic from `(generator_version, seed)`. During `evals verify`,
-each case runs in its own fresh `--network none` sandbox container (executing the pre-fix fail check and
-post-fix pass check inside it, sequentially, preserving the §6 per-case isolation boundary). To keep
-subsequent runs fast, `evals verify` caches each case's verification result keyed by a hash of the case
-contents and the sandbox image digest (`sha256(case_content_hash, sandbox_image_digest)`), so only new or
-changed cases re-run.
+string-built SQL) across 56 distinct base templates (8 distinct structural templates per taxonomy class).
+Generation is deterministic from `(generator_version, seed)`. During `evals verify`, each case runs in its own
+fresh `--network none` sandbox container (executing the pre-fix fail check and post-fix pass check inside it,
+sequentially, preserving the §6 per-case isolation boundary). To keep subsequent runs fast, `evals verify` caches
+each case's verification result keyed by a hash of the case contents and the sandbox image digest
+(`sha256(case_content_hash, sandbox_image_digest)`), so only new or changed cases re-run (measured cold runtime:
+425.11 s for 480 cases at ~0.89 s/case; warm cached re-run <0.01 s).
 
 **Separation rules (train never leaks into eval)**
-- `seeded_train` and `seeded_eval` are produced by different seed ranges and a dedupe step: any train
-  case whose normalized buggy-source hash or normalized reference-diff hash matches an eval case is
-  dropped. `evals verify` fails if any overlap exists.
+- **Template-level partition:** Exactly 25% of templates per taxonomy class (2 templates per class, 14 total)
+  are reserved exclusively for `seeded_eval`. The remaining 75% (6 templates per class, 42 total) are reserved
+  exclusively for `seeded_train`. The template sets are strictly disjoint (`eval_templates ∩ train_templates == ∅`),
+  enforced at runtime by generator rejection and validated by unit tests.
+- `seeded_train` and `seeded_eval` are produced by disjoint seed spaces (eval: base_seed + i*37; train: base_seed + 100_000 + i*53)
+  and a multi-tier dedupe step: any train case whose content hash, normalized buggy-source hash, reference-diff hash,
+  or mutation signature matches an eval case is dropped. `evals verify` fails if any overlap exists.
 - `realworld_eval`, `findings_eval` and `safety` are eval-only; they are never used for training or
   prompt tuning.
 

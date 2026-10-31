@@ -1,0 +1,8 @@
+# Light, local-only hooks. Install with: uvx pre-commit@4.7.0 install
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.17.3   # keep equal to ruff in pyproject.toml
+    hooks:
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format

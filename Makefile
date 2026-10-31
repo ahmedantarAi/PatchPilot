@@ -1,6 +1,9 @@
-.PHONY: help setup lint typecheck test check up down obs-up obs-down config sandbox-build clean
+.PHONY: help api setup lint typecheck test check up down obs-up obs-down config sandbox-build clean
 help:
-	@echo "Targets: setup lint typecheck test check up down obs-up obs-down config sandbox-build clean"
+	@echo "Targets: api setup lint typecheck test check up down obs-up obs-down config sandbox-build clean"
+
+api:
+	uv run --frozen uvicorn patchpilot.api:app --host 127.0.0.1 --port 8000
 
 setup:
 	uv sync --frozen
@@ -17,9 +20,9 @@ test:
 
 check: lint typecheck test
 
-# Core services only (no profile)
+# Core Compose services only (Qdrant; no profile). FastAPI runs on the host via `api`.
 up:
-	docker compose up -d --build api
+	docker compose up -d --wait qdrant
 down:
 	docker compose down
 
@@ -36,7 +39,7 @@ config:
 	docker compose --profile observability config -q
 
 sandbox-build:
-	docker compose build sandbox
+	docker build -t patchpilot-sandbox:0.0.0 sandbox
 
 clean:
 	docker compose --profile observability down -v --remove-orphans

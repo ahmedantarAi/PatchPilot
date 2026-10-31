@@ -3,7 +3,7 @@
 #>
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('help', 'setup', 'lint', 'typecheck', 'test', 'check', 'up', 'down',
+    [ValidateSet('help', 'api', 'setup', 'lint', 'typecheck', 'test', 'check', 'up', 'down',
                  'obs-up', 'obs-down', 'config', 'sandbox-build', 'clean')]
     [string]$Task = 'help'
 )
@@ -23,7 +23,8 @@ function Assert-EnvReady {
 }
 
 switch ($Task) {
-    'help'      { 'Tasks: setup lint typecheck test check up down obs-up obs-down config sandbox-build clean' }
+    'help'      { 'Tasks: api setup lint typecheck test check up down obs-up obs-down config sandbox-build clean' }
+    'api'       { Invoke-Step uv @('run', '--frozen', 'uvicorn', 'patchpilot.api:app', '--host', '127.0.0.1', '--port', '8000') }
     'setup'     { Invoke-Step uv @('sync', '--frozen') }
     'lint'      {
         Invoke-Step uv @('run', '--frozen', 'ruff', 'check', '.')
@@ -32,7 +33,7 @@ switch ($Task) {
     'typecheck' { Invoke-Step uv @('run', '--frozen', 'mypy', 'src') }
     'test'      { Invoke-Step uv @('run', '--frozen', 'pytest', '-q') }
     'check'     { & $PSCommandPath lint; & $PSCommandPath typecheck; & $PSCommandPath test }
-    'up'        { Invoke-Step docker @('compose', 'up', '-d', '--build', 'api') }
+    'up'        { Invoke-Step docker @('compose', 'up', '-d', '--wait', 'qdrant') }
     'down'      { Invoke-Step docker @('compose', 'down') }
     'obs-up'    { Assert-EnvReady; Invoke-Step docker @('compose', '--profile', 'observability', 'up', '-d') }
     'obs-down'  { Invoke-Step docker @('compose', '--profile', 'observability', 'down') }
@@ -40,6 +41,6 @@ switch ($Task) {
         Invoke-Step docker @('compose', 'config', '-q')
         Invoke-Step docker @('compose', '--profile', 'observability', 'config', '-q')
     }
-    'sandbox-build' { Invoke-Step docker @('compose', 'build', 'sandbox') }
+    'sandbox-build' { Invoke-Step docker @('build', '-t', 'patchpilot-sandbox:0.0.0', 'sandbox') }
     'clean'     { Invoke-Step docker @('compose', '--profile', 'observability', 'down', '-v', '--remove-orphans') }
 }

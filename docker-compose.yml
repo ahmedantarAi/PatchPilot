@@ -1,60 +1,29 @@
-# Core services have NO profile (start with a plain `docker compose up`).
-# Only the observability stack (Langfuse v4) uses `profiles: [observability]`.
-# Ollama is NOT here: it runs natively on the Windows host (reach it at host.docker.internal:11434).
+# Compose runs ONLY Qdrant (core, no profile) and the observability stack (profile: observability).
+# FastAPI and the orchestrator run on the Windows host (`uv run`); sandbox containers are launched by
+# the host orchestrator with `docker run` (SPEC.md section 6) and are NOT part of this file.
+# Ollama also runs natively on the host. Never mount the Docker socket into any service.
 #
-# Memory budget (mem_limit), hard ceiling 6144 MB total:
-#   core:           api 768 + sandbox 768                                   = 1536 MB
+# Compose memory budget (mem_limit), ceiling 6144 MB:
+#   core:           qdrant 512                                              =  512 MB
 #   observability:  web 1024 + worker 768 + clickhouse 1280
 #                   + postgres 384 + redis 128 + minio 256                  = 3840 MB
-#   total                                                                   = 5376 MB
-# Langfuse secrets default to empty so core services start without them; `make obs-up` checks them first.`n# Docker Desktop's WSL2 VM must be allowed >= 6 GB (see README / .wslconfig).
+#   total                                                                   = 4352 MB
+# Sandbox runs are sequential (max one at a time) and are not counted here (SPEC.md section 8).
+# Langfuse secrets default to empty so core starts without them; `obs-up` checks them first.
+# Docker Desktop's WSL2 VM should be allowed >= 6 GB (see README).
 
 name: patchpilot
 
 services:
   # ---------------- core ----------------
-  api:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    mem_limit: 768m
+  qdrant:
+    image: docker.io/qdrant/qdrant:v1.20.0
+    mem_limit: 512m
     restart: unless-stopped
-    environment:
-      PP_LLM_PROVIDER: ${PP_LLM_PROVIDER:-mock}
-      PP_OLLAMA_BASE_URL: ${PP_OLLAMA_BASE_URL_IN_DOCKER:-http://host.docker.internal:11434}
-      PP_OLLAMA_MODEL: ${PP_OLLAMA_MODEL:-qwen2.5-coder:7b}
-      PP_GEMINI_API_KEY: ${PP_GEMINI_API_KEY:-}
-      PP_GEMINI_MODEL: ${PP_GEMINI_MODEL:-gemini-2.5-flash}
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
     ports:
-      - "127.0.0.1:8000:8000"
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://localhost:8000/healthz')"]
-      interval: 10s
-      timeout: 3s
-      retries: 5
-
-  # Untrusted patch/test execution. Not a daemon: invoked per run via
-  # `docker compose run --rm sandbox <cmd>` (see SPEC.md section 6). Exits immediately on `up`.
-  sandbox:
-    build:
-      context: ./sandbox
-    command: ["true"]
-    restart: "no"
-    mem_limit: 768m
-    memswap_limit: 768m   # no swap
-    cpus: 1.0
-    pids_limit: 256
-    network_mode: none
-    read_only: true
-    cap_drop: [ALL]
-    security_opt: ["no-new-privileges:true"]
-    user: "10001:10001"
-    tmpfs:
-      - /tmp:rw,noexec,nosuid,size=128m
-      - /work:rw,nosuid,size=256m,uid=10001,gid=10001
-    working_dir: /work
+      - "127.0.0.1:6333:6333"
+    volumes:
+      - qdrant_data:/qdrant/storage
 
   # ---------------- observability (Langfuse v4, profile: observability) ----------------
   langfuse-web:
@@ -98,6 +67,15 @@ services:
       LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: http://localhost:9090
       LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: "true"
       LANGFUSE_S3_MEDIA_UPLOAD_PREFIX: media/
+      LANGFUSE_INIT_ORG_ID: ${LANGFUSE_INIT_ORG_ID:-}
+      LANGFUSE_INIT_ORG_NAME: ${LANGFUSE_INIT_ORG_NAME:-}
+      LANGFUSE_INIT_PROJECT_ID: ${LANGFUSE_INIT_PROJECT_ID:-}
+      LANGFUSE_INIT_PROJECT_NAME: ${LANGFUSE_INIT_PROJECT_NAME:-}
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: ${LANGFUSE_INIT_PROJECT_PUBLIC_KEY:-}
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: ${LANGFUSE_INIT_PROJECT_SECRET_KEY:-}
+      LANGFUSE_INIT_USER_EMAIL: ${LANGFUSE_INIT_USER_EMAIL:-}
+      LANGFUSE_INIT_USER_NAME: ${LANGFUSE_INIT_USER_NAME:-}
+      LANGFUSE_INIT_USER_PASSWORD: ${LANGFUSE_INIT_USER_PASSWORD:-}
 
   langfuse-worker:
     profiles: [observability]
@@ -166,7 +144,8 @@ services:
 
   langfuse-minio:
     profiles: [observability]
-    image: cgr.dev/chainguard/minio:latest   # NOT pinned: see DECISIONS.md D-07 / open questions
+    # Pinned by digest (image published 2026-10-29); Chainguard's free tier only exposes :latest, see DECISIONS.md D-07
+    image: cgr.dev/chainguard/minio@sha256:3b6e40c30ecd5cea627e382ff0b82ca841f58c52294578787043ee80c8ef7c82
     mem_limit: 256m
     restart: unless-stopped
     entrypoint: sh
@@ -185,6 +164,7 @@ services:
       retries: 10
 
 volumes:
+  qdrant_data:
   langfuse_postgres_data:
   langfuse_clickhouse_data:
   langfuse_clickhouse_logs:

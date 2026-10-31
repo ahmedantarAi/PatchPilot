@@ -16,5 +16,5 @@ class Settings(BaseSettings):
     ollama_base_url: str = "http://localhost:11434"
     ollama_model: str = "qwen2.5-coder:7b"
     gemini_api_key: str = ""
-    gemini_model: str = "gemini-2.5-flash"
+    gemini_model: str = ""  # required when provider=gemini; set PP_GEMINI_MODEL in .env
     request_timeout_s: float = 60.0

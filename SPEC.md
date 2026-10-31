@@ -1,6 +1,6 @@
 # PatchPilot — Specification
 
-Status: DRAFT, awaiting approval. Scaffold only; no feature code exists yet.
+Status: APPROVED (rev 3, pre-Phase 1 design review complete). Scaffold only; no feature code exists yet.
 
 ## 1. Purpose
 PatchPilot is an autonomous code review and patch verification agent. Given a pull request it:
@@ -12,103 +12,205 @@ Portfolio project. Constraints: Windows 11, 16 GB RAM, RTX 5050 8 GB VRAM, free 
 ## 2. Non-goals (v1)
 Merging PRs automatically; languages other than Python targets; multi-tenant hosting; any paid service.
 
-## 3. Architecture
+## 3. Architecture and process boundaries
 ```
-GitHub PR ─► FastAPI ─► LangGraph pipeline ─► LLMProvider ─► Ollama (host) | Gemini | Mock
-                          │  analyze → propose → verify(sandbox) → report
-                          ├─► Sandbox (ephemeral container, §6)
-                          └─► Langfuse traces (optional profile)
+HOST (Windows, `uv run`)                                   DOCKER (Compose)
+┌──────────────────────────────────────────────┐          ┌───────────────────────────┐
+│ FastAPI + LangGraph orchestrator             │─ HTTP ──►│ Qdrant (core, no profile) │
+│  analyze → propose ⇄ verify → report         │          ├───────────────────────────┤
+│        │            │                        │─ OTLP ──►│ Langfuse v4 stack         │
+│        │            └─► LLMProvider ─► Ollama (host)    │ (profile: observability)  │
+│        │                              Gemini | Mock      └───────────────────────────┘
+│        └─► `docker run` ─► SANDBOX container (one at a time, §6)   (not in Compose)
+└──────────────────────────────────────────────┘
 ```
+- **FastAPI and the orchestrator run on the host** (`uv run`). They are never containerised.
+- **Compose runs only Qdrant and the observability stack.** It contains no API service and no sandbox service.
+- **Sandbox containers are launched by the host orchestrator** with `docker run`, using the flags in §6.
 - Python 3.11, FastAPI, Pydantic v2, LangGraph; uv with pinned lockfile.
 - Pipeline nodes are pure functions over a typed state; LLM calls go only through `LLMProvider`.
+- **Pipeline nodes and state machine (`analyze → propose ⇄ verify → report`):**
+  - **`analyze`:** Runs Python stdlib `ast.parse` and `ruff check --output-format json --isolated --no-config`
+    (never loading target-repo configuration files on the host), retrieves relevant repository context from
+    Qdrant (§5) when available, and performs LLM diff/fault inspection. Emits typed `Finding` objects
+    (`file`, `line`, `category`, `explanation`, `fixable`). Used directly by `findings_eval` (PR review
+    mode) and feeds fixable findings / failing test context into `propose`.
+  - **`propose`:** Prompts the LLM for `SEARCH/REPLACE` blocks (while also accepting raw unified diffs, e.g.
+    from `MockProvider` or reference patches) and normalizes the result on the host via `difflib.unified_diff`
+    against the target snapshot file so hunk headers and line counts are always canonical.
+  - **`verify`:** Applies the canonical unified diff and runs the test suite inside the hardened sandbox (§6).
+    If patch application or tests fail and `attempt < max_attempts` (fixed `k = 3`), a conditional edge loops
+    back to `propose` with structured error/test-failure feedback. Attempt 1 records `pass@1`; succeeding
+    within `≤ 3` attempts records `pass@3`.
+  - **`report`:** Emits structured findings and only patches that achieved `verified = True` (`patch_applies`,
+    `target_test_passes`, and `regressions == 0`).
 
 ## 4. LLM provider interface
 Defined in `src/patchpilot/providers/base.py`.
 | Provider | Where it runs | Use |
 |---|---|---|
-| `ollama` | Native on Windows host (`localhost:11434`; `host.docker.internal:11434` from containers). Never in Docker. | local, private, GPU |
-| `gemini` | Gemini API free tier (HTTP) | stronger model, rate-limited |
+| `ollama` | Native on Windows host (`http://localhost:11434`). Never in Docker. Default model `qwen2.5-coder:7b` (`PP_OLLAMA_MODEL`). | local, private, GPU |
+| `gemini` | Gemini API free tier, plain `httpx` (no vendor SDK). Model name comes from `PP_GEMINI_MODEL` in `.env`; there is no hardcoded default in code. | stronger model, rate-limited; **public/synthetic code only (§9)** |
 | `mock` | in-process, deterministic, no network | unit tests and CI (mandatory in CI) |
 
 Contract: `async generate(LLMRequest) -> LLMResponse`; failures raise `ProviderError`.
-Selection: `PP_LLM_PROVIDER` or explicit argument. Dynamic routing (v1+) is a separate `Router` that
-itself implements `LLMProvider`, choosing among the three by task difficulty, quota, and failure.
-Gemini free-tier limits and model names change; they are read from config, not hardcoded, and must be
-re-verified at implementation time.
+`LLMRequest` carries `data_class: Literal["private", "public"] = "private"` (defaulting to `"private"` so
+unmarked requests fail closed; synthetic/generated eval prompts explicitly pass `data_class="public"`).
+Selection: `PP_LLM_PROVIDER` or explicit argument. Dynamic routing (later phase) is a `Router` that
+itself implements `LLMProvider`, choosing among the three by task difficulty, quota, failure, and
+the data-privacy rule in §9.
 
-## 5. Observability
-Langfuse v4 self-hosted, Compose profile `observability` only. Requires 6 containers (web, worker,
-ClickHouse, Postgres, Redis, MinIO); this is the minimum official topology, so there is no lighter
-self-hosted variant. Core services never depend on it; tracing must degrade to a no-op if Langfuse
-is down or unconfigured.
+**Gemini model names (checked 2026-10-31 against ai.google.dev/gemini-api/docs/pricing).** Text models
+listed with a free tier: `gemini-3.8-flash` (chosen as the `.env.example` value), `gemini-3.6-flash`,
+`gemini-3.5-flash-lite`, `gemini-3.1-flash-lite`, `gemini-2.5-flash-lite`. The 2.5 family may be limited to
+projects that already used it. Names and limits change; re-check at phase 1 and whenever calls start
+failing. Rate limits (RPM/TPM/RPD) are per project and are not recorded here; read them in AI Studio.
+
+**Reaching host Ollama from a container (tested 2026-10-31).** Nothing in the current design needs this:
+FastAPI and the orchestrator run on the host, and sandbox containers have no network. Result of the test:
+with Ollama 0.30.7 listening on its default `127.0.0.1:11434` and Docker Desktop (WSL2 backend), a
+container started with plain `docker run` reached `http://host.docker.internal:11434/api/version` and got
+`{"version":"0.30.7"}`, with no `extra_hosts` entry and no `OLLAMA_HOST` change. This may differ on other
+Docker setups. Fallback if it ever fails: set `OLLAMA_HOST=0.0.0.0:11434` on the host and restart Ollama.
+**Warning:** that exposes Ollama, which has no authentication, to your LAN; first add a Windows Firewall
+inbound rule that limits TCP 11434 to the Docker/WSL subnet (or to localhost) and blocks other sources.
+Never expose it to the sandbox network.
+
+## 5. Services in Compose
+**Qdrant** (core, no profile): vector store for repository code retrieval. Bound to 127.0.0.1:6333.
+Accessed via plain `httpx` against Qdrant's REST API (no extra SDK dependency). Embeddings go through an
+`Embedder` protocol: `OllamaEmbedder` (`POST /api/embed`) in live mode and a deterministic hashed-token
+`HashEmbedder` in `mock`/CI mode so retrieval tests never call external models. Pipeline must degrade
+gracefully (no retrieval) if Qdrant is down.
+
+**Langfuse v4** (profile `observability` only): 6 containers (web, worker, ClickHouse, Postgres, Redis,
+MinIO). This is the minimum official topology; there is no lighter self-hosted variant. Core code never
+depends on it; tracing is a no-op if Langfuse is down or unconfigured. It stays an **optional** profile.
+To allow non-interactive startup on a fresh volume (`obs-up` → `trace-smoke`), `langfuse-web` is wired
+with `LANGFUSE_INIT_*` headless provisioning variables in `docker-compose.yml` and `.env.example`.
+The current per-service memory limits (§8) are accepted for now; they are estimates and real usage will be
+measured later. **Fallback:** if the local stack proves too heavy, use Langfuse Cloud's free tier instead
+(set `LANGFUSE_HOST` and keys in `.env`); that sends traces to a third party, so code in traces must obey the
+same public-only rule as §9. All images are pinned (MinIO by digest).
 
 ## 6. Sandbox for untrusted patches and tests
 Threat model: the PR author, the LLM output, and the repo's test code are all untrusted. They may try
 to exfiltrate secrets, reach the network or LAN, escape the container, fork-bomb, fill disk, or hang.
 
-**Execution model.** One fresh container per verification run, destroyed afterwards. Created from
-`sandbox/Dockerfile` (toolchain only: no secrets, no PatchPilot code). The repo is copied in
-(not bind-mounted from the host working tree); the patch is applied inside the container.
+**Execution model.** The host orchestrator launches one fresh container per verification run with
+`docker run --rm`, from the image built from `sandbox/Dockerfile` (toolchain only: no secrets, no
+PatchPilot code; uses a pure-Python runner entrypoint baked into `sandbox/` with no extra `apt-get`
+packages). The repo snapshot and patch are streamed in as a tar on stdin and safely extracted into the
+tmpfs `/work` by the container entrypoint (rejecting path-traversal and symlink escapes; no host bind
+mounts); the unified diff is applied in Python and `pytest` runs inside. The container is removed
+afterwards. Runs are **sequential: at most one sandbox at a time**, enforced by a fail-fast cross-process
+OS file lock + in-process async lock that raises `SandboxBusyError` on concurrent attempts.
 
-**Mandatory controls** (the Compose `sandbox` service is the reference configuration):
+**Mandatory `docker run` flags / controls:**
 | Control | Setting |
 |---|---|
-| Network | `network_mode: none` (no egress, no host access). Dependencies must be pre-baked or vendored in a prior, separate, network-enabled *fetch* step that runs no repo code. |
-| Privileges | non-root uid 10001, `cap_drop: ALL`, `no-new-privileges`, default seccomp profile |
-| Filesystem | read-only root; writable only tmpfs `/work` (256 MB) and `/tmp` (128 MB, noexec) |
-| Resources | 768 MB RAM, no swap, 1 CPU, `pids_limit` 256 |
-| Time | hard wall-clock timeout (default 120 s) enforced by the orchestrator, which kills and removes the container |
-| Secrets | no env vars passed through, no Docker socket, no mounted host paths |
-| Output | stdout/stderr captured with a size cap (1 MB); results returned as structured JSON (exit code, junit XML) |
-| Logging | each run logs image digest, limits, duration, exit status |
+| Network | `--network none` (no egress, no host/LAN access). Dependencies are pre-baked in the image or installed in a separate, network-enabled **install step** (accepted for v1) that runs no repo code: it mounts a cache volume (`patchpilot-deps-<sha256>`) and runs `pip install --only-binary :all: --no-build-isolation --no-input --target /deps` with only the pinned requirements list present (no repo files, no `setup.py`/build hooks), then mounts `/deps:ro` (`PYTHONPATH=/deps`) into the `--network none` verification container. |
+| Privileges | `--user 10001:10001 --cap-drop ALL --security-opt no-new-privileges`, default seccomp |
+| Filesystem | `--read-only`; writable only `--tmpfs /work:rw,nosuid,size=256m,uid=10001,gid=10001` and `--tmpfs /tmp:rw,noexec,nosuid,size=128m` |
+| Resources | `--memory 768m --memory-swap 768m --cpus 1 --pids-limit 256` |
+| Time | hard wall-clock timeout (default 120 s) enforced by the orchestrator: `docker kill` then `docker rm -f` |
+| Secrets | no `-e` passthrough, no mounted host paths, no Docker socket |
+| Output | stdout/stderr size-capped (1 MB); result returned as structured JSON (exit code, junit XML) |
+| Logging | each run records image digest, flags, duration, exit status |
 
-**Rules.** The API process must never run repo code itself. The Docker socket is never mounted into any
-container; the orchestrator runs on the host (or a trusted worker) and calls Docker directly.
-Known residual risk: Docker containers share the WSL2 VM kernel; a kernel escape is out of scope for v1.
-Hardening upgrade path: gVisor/`runsc` or a disposable WSL distro (see open questions).
+**Rules.** The API/orchestrator process never executes repo code itself. The Docker socket/pipe is
+used only by the host orchestrator and is never mounted into any container. Hardened Docker (no network,
+read-only filesystem, non-root, dropped capabilities, resource limits) is considered sufficient for v1.
 
-**Acceptance tests (to be written before the sandbox is trusted):** a corpus of hostile fixtures that
-must all be contained: outbound HTTP, reading `/proc/1/environ` of host, fork bomb, `dd` to fill disk,
-infinite loop, memory balloon, writing outside `/work`, symlink escape from the copied repo.
+**Known limitation (shared kernel).** Sandbox containers share the Linux kernel of the Docker Desktop
+WSL2 VM with every other container (Qdrant, Langfuse). A kernel or runtime vulnerability could let hostile
+code escape to that VM, which is not a full VM boundary. v1 accepts this risk and therefore must not be used
+on code more hostile than ordinary PRs from untrusted but non-targeted authors; keep Docker Desktop updated.
+Upgrade path: gVisor (`runsc`) or a disposable WSL distro/VM.
+
+**Hostile fixtures (acceptance suite; all must be contained):** `network_egress`, `read_host_env`,
+`fork_bomb`, `disk_fill`, `infinite_loop`, `memory_balloon`, `write_outside_work`, `symlink_escape`.
 
 ## 7. Eval dataset plan
-Goal: measure (a) whether proposed patches are *correct* and (b) whether the system routes/traces sanely.
-No performance claims are published until the harness has produced them (see README policy).
+Goal: measure (a) whether proposed patches are *correct* and (b) whether routing and tracing behave.
+No performance claim is published until the harness has produced it (README policy, AGENTS rule 8).
 
-**Datasets (all free):**
-1. **Seeded-bug set (primary, owned):** small Python repos with injected bugs from a taxonomy (off-by-one,
-   wrong operator, None handling, missing await, resource leak, bad default arg, SQL-injection style
-   string building). Each case = repo snapshot + failing test + known-good fix. Target 100 cases, built
-   by script so it is reproducible and licence-clean.
-2. **Real-world set:** a curated sample of merged bug-fix commits from permissively licensed Python
-   repos (pre-fix commit, failing test from the fix commit, reference diff). Target 50 cases; record
-   license per case. Optionally compare with SWE-bench Lite style tasks, subject to licence and disk checks.
-3. **Review-quality set:** PRs with human-labelled true/false findings for static-analysis triage
-   (target 100 findings).
-4. **Safety set:** the hostile fixtures from §6, as pass/fail.
+**Pools and targets**
+| Pool | Target size | Source | Used for |
+|---|---|---|---|
+| `seeded_eval` | **≥ 100** (plan: 120) | script-generated seeded bugs, fixed seeds | evaluation only |
+| `seeded_train` | **≥ 300** (plan: 360) | script-generated seeded bugs, **disjoint seeds**, separate generator run | QLoRA distillation / prompt dev only; **never in eval** |
+| `realworld_eval` | **20** | bundled curated manifest of merged bug-fix commits from MIT/Apache-2.0/BSD repos | evaluation only |
+| `findings_eval` | **50** labelled findings | bundled curated manifest of PR findings with human true/false labels, from MIT/Apache-2.0/BSD repos | review precision/recall |
+| `safety` | **8** fixtures | §6 | containment pass/fail |
 
-**Splits.** dev (60%), held-out test (40%), frozen before any prompt tuning. For QLoRA distillation
-data, training examples are generated only from dev; test cases never enter training. Check for
-contamination against public benchmarks and base-model data where possible.
+With 20 real cases and 50 findings, real-world and review metrics will have wide uncertainty; reports must
+show the case counts next to any metric.
+
+**Licensing & offline reproducibility.** Real-world cases and findings come from bundled, self-contained
+offline manifests extracted from repositories under MIT, Apache-2.0, BSD-2-Clause or BSD-3-Clause so
+`evals build` runs deterministically without network access. Each case's `meta.json` records `repo`,
+`commit`, `license` (SPDX id) and `license_source` (the file/URL checked). `evals verify` fails on a
+missing or non-allowlisted license.
+
+Each seeded case = repo snapshot + failing test + known-good fix, produced by a generator over a bug
+taxonomy (off-by-one, wrong operator, None handling, missing await, resource leak, mutable default arg,
+string-built SQL). Generation is deterministic from `(generator_version, seed)`. During `evals verify`,
+each case runs in its own fresh `--network none` sandbox container (executing the pre-fix fail check and
+post-fix pass check inside it, sequentially, preserving the §6 per-case isolation boundary). To keep
+subsequent runs fast, `evals verify` caches each case's verification result keyed by a hash of the case
+contents and the sandbox image digest (`sha256(case_content_hash, sandbox_image_digest)`), so only new or
+changed cases re-run.
+
+**Separation rules (train never leaks into eval)**
+- `seeded_train` and `seeded_eval` are produced by different seed ranges and a dedupe step: any train
+  case whose normalized buggy-source hash or normalized reference-diff hash matches an eval case is
+  dropped. `evals verify` fails if any overlap exists.
+- `realworld_eval`, `findings_eval` and `safety` are eval-only; they are never used for training or
+  prompt tuning.
+
+**Freeze.** The eval split (all eval-only pools) is **frozen before any tuning, prompt iteration or
+training starts**: `evals freeze` writes `evals/FROZEN.json` (case ids, per-case content hashes, generator
+version, seed ranges, overall sha256). It is committed. `evals verify-frozen` runs in CI and fails on any
+change; changing the eval set requires a new dataset version and a DECISIONS.md entry, and invalidates
+earlier comparisons.
 
 **Metrics.** Patch applies cleanly; target failing test passes; no previously passing test regresses
-(pass@1, and pass@k with fixed k); review precision/recall on labelled findings; sandbox containment
-rate; cost proxies (tokens, latency) per provider. Report with run count, seed, model version, and
-confidence intervals; LLM nondeterminism means ≥3 runs per config.
+(`pass@1` on attempt 1 and `pass@k` at fixed `k = 3` across the bounded retry loop); review
+precision/recall on `findings_eval`; sandbox containment; tokens and latency per provider. Reports
+include run count, seed, model version and confidence intervals; ≥ 3 runs per configuration because LLMs
+are nondeterministic.
 
-**Layout.** `evals/datasets/<name>/<case_id>/{repo/,meta.json}`, results in `evals/results/` (gitignored,
-summaries committed). Each eval run is a Langfuse dataset run when observability is up, and writes a
-local JSON when not. CI runs only a tiny mock-provider eval for plumbing, never model quality.
+**QLoRA distillation handoff (Phase 8).** Training dependencies (`torch`, `transformers`, `peft`,
+`bitsandbytes`) are never added to `pyproject.toml`. Instead, `seeded_train` is exported as JSONL for a
+standalone Colab notebook that fine-tunes `Qwen2.5-Coder-7B`, exports a quantized GGUF + `Modelfile`, and
+registers the model in local Ollama (`ollama create`) so `evals compare` evaluates both baseline and
+candidate through `OllamaProvider`.
+
+**Layout.** `evals/datasets/<pool>/<case_id>/{repo/,meta.json}`; results in `evals/results/<run_id>/`
+(gitignored; summaries committed and cited by run id). CI runs only a tiny mock-provider eval for
+plumbing, never model quality.
 
 ## 8. Resource budget
-Compose memory limits total ≤ 6144 MB (currently 5376 MB: core 1536 MB, observability 3840 MB);
-see `docker-compose.yml`. Ollama and its VRAM/RAM use are outside this budget (host process); the
-8 GB VRAM bounds usable local models. These are *limits*, not measurements.
+- **Compose total ≤ 6144 MB** via per-service `mem_limit`: Qdrant 512 MB + observability 3840 MB
+  (web 1024, worker 768, ClickHouse 1280, Postgres 384, Redis 128, MinIO 256) = **4352 MB**.
+- **Sandbox runs are sequential, at most one at a time, and are not counted in the Compose total.**
+  Each run is capped at 768 MB RAM / 1 CPU (§6); the orchestrator holds a single-run lock.
+- Host processes (FastAPI, orchestrator, Ollama and its VRAM/RAM) are outside Compose. The 8 GB VRAM
+  bounds usable local models. These are *limits*, not measurements. With the Compose stack at its
+  ceiling, one sandbox and the host processes, total demand against 16 GB host RAM is unmeasured.
 
-## 9. Security & secrets
-`.env` is gitignored; `.env.example` holds placeholders. Langfuse telemetry disabled. All ports bind to
-127.0.0.1. No secret ever enters the sandbox.
+## 9. Security, privacy & secrets
+- **Never send private code to the Gemini free tier.** Free-tier inputs may be used by Google to improve
+  its products. Only repositories explicitly marked `public` (or synthetic/generated eval data, which
+  sets `data_class="public"`) may be sent to `gemini`. Anything unmarked defaults to
+  `data_class: Literal["private", "public"] = "private"` on `LLMRequest` and may go only to `ollama` or
+  `mock`. The Gemini provider and Router reject non-`"public"` requests with `ProviderError`, enforced in
+  code and covered by unit tests. Secrets, `.env` contents and credentials never enter any prompt.
+- `.env` is gitignored; `.env.example` holds placeholders. Langfuse telemetry disabled.
+  Traces may contain code: Langfuse is local-only and not exposed beyond 127.0.0.1.
+- All Compose ports bind to 127.0.0.1. No secret ever enters the sandbox.
 
 ## 10. Definition of done for the scaffold
-`make check` / `.\tasks.ps1 check` passes; `docker compose config` validates with and without
+`.\tasks.ps1 check` and `.\tasks.ps1 config` pass; `docker compose config` validates with and without
 `--profile observability`; CI is green using only the mock provider.

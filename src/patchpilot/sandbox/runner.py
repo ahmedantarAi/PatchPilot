@@ -94,6 +94,12 @@ class SandboxResult(BaseModel):
     image_digest: str = ""
     duration_s: float = 0.0
     limits: dict[str, object] = Field(default_factory=lambda: dict(SANDBOX_LIMITS))
+    verify_mode: bool = False
+    verified: bool = False
+    pre_fix_failed: bool = False
+    post_fix_passed: bool = False
+    pre_fix: dict[str, object] | None = None
+    post_fix: dict[str, object] | None = None
 
 
 class InstallStepResult(BaseModel):
@@ -248,6 +254,7 @@ def build_docker_run_cmd(
     memory_swap: str = "768m",
     cpus: str = "1",
     pids_limit: int | str = 256,
+    extra_args: list[str] | None = None,
 ) -> list[str]:
     """Build the hardened `docker run` command with all mandatory SPEC §6 controls."""
     cmd = [
@@ -290,6 +297,8 @@ def build_docker_run_cmd(
         validate_deps_volume_name(deps_volume)
         cmd.extend(["-v", f"{deps_volume}:/deps:ro", "-e", "PYTHONPATH=/deps"])
     cmd.append(image)
+    if extra_args:
+        cmd.extend(extra_args)
     return cmd
 
 
@@ -599,6 +608,7 @@ class SandboxRunner:
         deps_volume: str | None = None,
         timeout_s: float | None = None,
         tar_bytes: bytes | None = None,
+        verify: bool = False,
     ) -> SandboxResult:
         """Run a single verification container synchronously under the single-run lock."""
         effective_timeout = timeout_s if timeout_s is not None else self.timeout_s
@@ -611,6 +621,7 @@ class SandboxRunner:
                 symlinks=symlinks,
                 patch_diff=patch_diff,
                 pytest_args=pytest_args,
+                verify=verify,
             )
         )
         container_name = f"{SANDBOX_CONTAINER_PREFIX}{uuid.uuid4().hex[:12]}"
@@ -619,6 +630,8 @@ class SandboxRunner:
             "deps_volume": deps_volume,
             **self.override_limits,
         }
+        if verify:
+            run_kwargs["extra_args"] = ["--verify"]
         cmd = build_docker_run_cmd(
             container_name,
             **run_kwargs,  # type: ignore[arg-type]
@@ -737,6 +750,7 @@ class SandboxRunner:
         deps_volume: str | None = None,
         timeout_s: float | None = None,
         tar_bytes: bytes | None = None,
+        verify: bool = False,
     ) -> SandboxResult:
         """Async wrapper around `run_sync` running under the thread lock."""
         return await asyncio.to_thread(
@@ -749,6 +763,7 @@ class SandboxRunner:
             deps_volume=deps_volume,
             timeout_s=timeout_s,
             tar_bytes=tar_bytes,
+            verify=verify,
         )
 
 
@@ -808,6 +823,8 @@ def _parse_container_output(
             combined_stderr = inner_stderr
 
         raw_err = payload.get("error")
+        raw_pre_fix = payload.get("pre_fix")
+        raw_post_fix = payload.get("post_fix")
         return SandboxResult(
             exit_code=int(payload.get("exit_code", container_exit_code)),
             patch_applied=bool(payload.get("patch_applied", False)),
@@ -823,6 +840,12 @@ def _parse_container_output(
             image_digest=image_digest,
             duration_s=duration_s,
             limits=limits,
+            verify_mode=bool(payload.get("verify_mode", False)),
+            verified=bool(payload.get("verified", False)),
+            pre_fix_failed=bool(payload.get("pre_fix_failed", False)),
+            post_fix_passed=bool(payload.get("post_fix_passed", False)),
+            pre_fix=raw_pre_fix if isinstance(raw_pre_fix, dict) else None,
+            post_fix=raw_post_fix if isinstance(raw_post_fix, dict) else None,
         )
 
     effective_exit = container_exit_code if container_exit_code != 0 else 1

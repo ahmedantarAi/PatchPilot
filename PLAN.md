@@ -39,7 +39,7 @@ uv run --frozen python -m patchpilot.evals verify-frozen
 ```
 Expected, in order: `built seeded_eval=120 seeded_train=360 realworld_eval=20 findings_eval=50 safety=8` ·
 `OK: every seeded case fails before fix and passes after fix; train/eval overlap = 0; all real-world/findings licenses in {MIT, Apache-2.0, BSD-2-Clause, BSD-3-Clause}` ·
-`wrote evals/FROZEN.json sha256=<64 hex>` · `OK: frozen eval split unchanged`. `realworld_eval` and `findings_eval` are materialized offline from bundled curated manifests; `evals verify` runs one fresh `--network none` sandbox container per case (pre-fix and post-fix checks inside it, sequentially) and caches each case's verify result keyed by a hash of the case contents and the sandbox image digest so only changed cases re-run (expected runtime: ~8–16 min cold first run for 480 containers at ~1–2 s/container, <5 s warm cached re-run; *estimate only until measured*). No tuning or training starts before
+`wrote evals/FROZEN.json sha256=<64 hex>` · `OK: frozen eval split unchanged`. `realworld_eval` and `findings_eval` are materialized offline from bundled curated manifests; `evals verify` runs one fresh `--network none` sandbox container per case (pre-fix and post-fix checks inside it, sequentially) and caches each case's verify result keyed by a hash of the case contents and the sandbox image digest so only changed cases re-run (measured runtime: 421.89 s / ~7.0 min cold first run for 480 containers at ~0.89 s/container, <0.01 s warm cached re-run; verified 2026-10-31). No tuning or training starts before
 the `freeze` step has been committed.
 
 ## Phase 4 — LangGraph pipeline (analyze → propose ⇄ verify → report) + Qdrant retrieval

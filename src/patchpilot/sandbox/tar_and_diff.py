@@ -62,6 +62,7 @@ class ExtractedPayload:
     patch_diff: str = ""
     pytest_args: list[str] = field(default_factory=list)
     files_extracted: int = 0
+    verify_mode: bool = False
 
 
 @dataclass
@@ -144,6 +145,7 @@ def build_repo_tar(
     symlinks: Mapping[str, str] | None = None,
     patch_diff: str = "",
     pytest_args: list[str] | None = None,
+    verify: bool = False,
 ) -> bytes:
     """Build an in-memory tar archive for sandbox stdin without dereferencing host symlinks."""
     if patch_diff and len(patch_diff.encode("utf-8")) > MAX_PATCH_BYTES:
@@ -168,8 +170,13 @@ def build_repo_tar(
         if patch_diff:
             _add_bytes_to_tar(tar, PATCH_MEMBER_NAME, patch_diff.encode("utf-8"))
 
+        meta_obj: dict[str, object] = {}
         if pytest_args:
-            meta_bytes = json.dumps({"pytest_args": pytest_args}).encode("utf-8")
+            meta_obj["pytest_args"] = list(pytest_args)
+        if verify:
+            meta_obj["verify"] = True
+        if meta_obj:
+            meta_bytes = json.dumps(meta_obj).encode("utf-8")
             _add_bytes_to_tar(tar, META_MEMBER_NAME, meta_bytes)
 
     return buf.getvalue()
@@ -276,6 +283,8 @@ def safe_extract_tar(stream: IO[bytes], work_dir: Path) -> ExtractedPayload:
                             args = meta_raw.get("pytest_args", [])
                             if isinstance(args, list) and all(isinstance(a, str) for a in args):
                                 payload.pytest_args = list(args)
+                            if bool(meta_raw.get("verify", False)):
+                                payload.verify_mode = True
                     continue
 
                 if normalized_name.startswith(META_PREFIX):

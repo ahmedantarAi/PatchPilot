@@ -10,5 +10,8 @@ dist/
 build/
 # runtime artifacts
 .work/
+.cache/
+evals/datasets/
+evals/.cache/
 evals/results/
 *.log

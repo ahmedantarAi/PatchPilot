@@ -37,6 +37,7 @@ markers = [
 line-length = 100
 target-version = "py311"
 src = ["src", "tests"]
+extend-exclude = ["evals/datasets"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]

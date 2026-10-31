@@ -55,6 +55,7 @@ class ExtractedPayload:
     patch_diff: str = ""
     pytest_args: list[str] = field(default_factory=list)
     files_extracted: int = 0
+    verify_mode: bool = False
 
 
 @dataclass
@@ -174,6 +175,8 @@ def safe_extract_tar(stream: BinaryIO, work_dir: Path) -> ExtractedPayload:
                             args = meta_raw.get("pytest_args", [])
                             if isinstance(args, list) and all(isinstance(a, str) for a in args):
                                 payload.pytest_args = list(args)
+                            if bool(meta_raw.get("verify", False)):
+                                payload.verify_mode = True
                     continue
 
                 if normalized_name.startswith(META_PREFIX):
@@ -765,6 +768,81 @@ def main(argv: list[str] | None = None) -> int:
         sys.stdout.flush()
         return 2
 
+    if work_dir.is_symlink() or not stat.S_ISDIR(work_dir.stat().st_mode):
+        err_result = {
+            "exit_code": 2,
+            "patch_applied": False,
+            "timed_out": False,
+            "stdout": "",
+            "stderr": "/work is not a valid directory",
+            "stdout_truncated": False,
+            "stderr_truncated": False,
+            "junit_xml": "",
+            "junit": parse_junit_xml(""),
+            "error": "WorkDirError: /work is not a valid directory",
+        }
+        sys.stdout.write(json.dumps(err_result) + "\n")
+        sys.stdout.flush()
+        return 2
+
+    verify_mode = ("--verify" in args) or extracted.verify_mode
+    if verify_mode:
+        # Pre-fix check: tests must run and fail
+        pre_result = run_pytest_in_work(work_dir, extra_args=extracted.pytest_args)
+        pre_failed = bool(
+            int(pre_result.get("exit_code", 0)) != 0
+            and (
+                int(pre_result.get("junit", {}).get("failures", 0)) > 0
+                or int(pre_result.get("junit", {}).get("errors", 0)) > 0
+            )
+        )
+
+        patch_applied = False
+        patch_err = None
+        if extracted.patch_diff.strip():
+            try:
+                apply_unified_diff(extracted.patch_diff, work_dir)
+                patch_applied = True
+            except PatchApplyError as exc:
+                patch_err = str(exc)
+        else:
+            patch_err = "No patch diff provided for verification"
+
+        post_result = None
+        post_passed = False
+        if patch_applied:
+            post_result = run_pytest_in_work(work_dir, extra_args=extracted.pytest_args)
+            post_passed = bool(
+                int(post_result.get("exit_code", 1)) == 0
+                and int(post_result.get("junit", {}).get("failures", 1)) == 0
+                and int(post_result.get("junit", {}).get("errors", 1)) == 0
+                and int(post_result.get("junit", {}).get("passed", 0)) > 0
+            )
+
+        verified = bool(pre_failed and patch_applied and post_passed)
+        active_res = post_result if post_result is not None else pre_result
+        combined_result = {
+            "verify_mode": True,
+            "verified": verified,
+            "pre_fix_failed": pre_failed,
+            "patch_applied": patch_applied,
+            "post_fix_passed": post_passed,
+            "exit_code": 0 if verified else 1,
+            "pre_fix": pre_result,
+            "post_fix": post_result,
+            "error": patch_err if not patch_applied else None,
+            "stdout": active_res.get("stdout", ""),
+            "stderr": active_res.get("stderr", ""),
+            "stdout_truncated": bool(active_res.get("stdout_truncated", False)),
+            "stderr_truncated": bool(active_res.get("stderr_truncated", False)),
+            "junit_xml": active_res.get("junit_xml", ""),
+            "junit": active_res.get("junit", parse_junit_xml("")),
+            "timed_out": False,
+        }
+        sys.stdout.write(json.dumps(combined_result) + "\n")
+        sys.stdout.flush()
+        return 0 if verified else 1
+
     try:
         if extracted.patch_diff.strip():
             apply_unified_diff(extracted.patch_diff, work_dir)
@@ -784,23 +862,6 @@ def main(argv: list[str] | None = None) -> int:
         sys.stdout.write(json.dumps(err_result) + "\n")
         sys.stdout.flush()
         return 3
-
-    if work_dir.is_symlink() or not stat.S_ISDIR(work_dir.stat().st_mode):
-        err_result = {
-            "exit_code": 2,
-            "patch_applied": False,
-            "timed_out": False,
-            "stdout": "",
-            "stderr": "/work is not a valid directory",
-            "stdout_truncated": False,
-            "stderr_truncated": False,
-            "junit_xml": "",
-            "junit": parse_junit_xml(""),
-            "error": "WorkDirError: /work is not a valid directory",
-        }
-        sys.stdout.write(json.dumps(err_result) + "\n")
-        sys.stdout.flush()
-        return 2
 
     result = run_pytest_in_work(work_dir, extra_args=extracted.pytest_args)
     sys.stdout.write(json.dumps(result) + "\n")

@@ -1,4 +1,4 @@
-"""CLI entrypoint for PatchPilot: python -m patchpilot run ..."""
+"""CLI entrypoint for PatchPilot: python -m patchpilot run | trace-smoke ..."""
 
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ from patchpilot.providers.base import LLMProvider
 from patchpilot.providers.mock import MockProvider
 from patchpilot.retrieval import HashEmbedder, OllamaEmbedder, QdrantStore
 from patchpilot.sandbox.runner import SandboxRunner
+from patchpilot.tracing import run_trace_smoke
 
 logging.basicConfig(level=logging.WARNING, format="%(levelname)s: %(message)s")
 logger = logging.getLogger("patchpilot.cli")
@@ -118,6 +119,12 @@ async def _run_command(case_arg: str, provider_name: str) -> int:
     return 0
 
 
+async def _trace_smoke_command() -> int:
+    _, msg = await run_trace_smoke()
+    print(msg)
+    return 0
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(prog="patchpilot", description="PatchPilot CLI")
     subparsers = parser.add_subparsers(dest="subcommand", required=True)
@@ -131,10 +138,18 @@ def main() -> None:
         help="LLM provider name (default: mock)",
     )
 
+    subparsers.add_parser(
+        "trace-smoke",
+        help="Verify Langfuse trace ingestion/visibility or degrade to no-op when down",
+    )
+
     args = parser.parse_args()
 
     if args.subcommand == "run":
         exit_code = asyncio.run(_run_command(args.case, args.provider))
+        sys.exit(exit_code)
+    elif args.subcommand == "trace-smoke":
+        exit_code = asyncio.run(_trace_smoke_command())
         sys.exit(exit_code)
     else:
         sys.exit(1)

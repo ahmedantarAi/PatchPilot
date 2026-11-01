@@ -22,6 +22,13 @@ jobs:
       - run: uv run --frozen pytest -q
         env:
           PP_LLM_PROVIDER: mock
+      - name: Tiny mock-provider eval run for plumbing
+        run: |
+          uv run --frozen python -m patchpilot.evals verify-frozen
+          uv run --frozen python -m patchpilot.evals run --pool seeded_train --provider mock --runs 1 --seed 1337 --limit 2
+        env:
+          PYTHONPATH: src
+          PP_LLM_PROVIDER: mock
       - name: Validate compose (core and observability profile)
         run: |
           docker compose config -q

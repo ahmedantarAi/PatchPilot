@@ -1,13 +1,15 @@
-"""CLI entrypoint for Phase 3 evaluation datasets: build, verify, freeze, and verify-frozen."""
+"""CLI entrypoint for Phase 3 & Phase 5 evaluation harness."""
 
 from __future__ import annotations
 
 import argparse
+import asyncio
 import sys
 from pathlib import Path
 
 from patchpilot.evals.freeze import freeze_eval_split, verify_frozen_eval_split
 from patchpilot.evals.generator import build_and_materialize_all
+from patchpilot.evals.runner import EvalIntegrityError, format_eval_summary, run_eval_pool
 from patchpilot.evals.taxonomy import (
     BASE_TEMPLATES,
     get_eval_templates_per_class,
@@ -18,6 +20,7 @@ from patchpilot.evals.verifier import run_verify
 
 DEFAULT_DATASETS_DIR = Path("evals/datasets")
 DEFAULT_FROZEN_FILE = Path("evals/FROZEN.json")
+DEFAULT_RESULTS_DIR = Path("evals/results")
 DEFAULT_REPORT_FILE = Path("evals/results/verify_report.json")
 
 
@@ -133,10 +136,33 @@ def cmd_verify_frozen(args: argparse.Namespace) -> int:
         return 1
 
 
+def cmd_run(args: argparse.Namespace) -> int:
+    try:
+        _, summary = asyncio.run(
+            run_eval_pool(
+                pool=args.pool,
+                provider_name=args.provider,
+                runs=int(args.runs),
+                seed=int(args.seed),
+                limit=args.limit,
+                datasets_dir=Path(args.datasets_dir),
+                results_dir=Path(args.results_dir),
+                frozen_path=Path(args.frozen),
+                run_id=args.run_id,
+            )
+        )
+    except EvalIntegrityError as exc:
+        print(f"FAIL: {exc}", file=sys.stderr)
+        return 1
+
+    print(format_eval_summary(summary))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="patchpilot.evals",
-        description="PatchPilot Phase 3 evaluation harness CLI",
+        description="PatchPilot evaluation harness CLI",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -204,6 +230,38 @@ def main(argv: list[str] | None = None) -> int:
         help="Path to FROZEN.json",
     )
 
+    # run
+    p_run = subparsers.add_parser("run", help="Run evaluation pool through the repair pipeline")
+    p_run.add_argument("--pool", required=True, help="Dataset pool name (e.g. seeded_train)")
+    p_run.add_argument(
+        "--provider",
+        required=True,
+        choices=["mock", "ollama", "gemini"],
+        help="LLM provider name",
+    )
+    p_run.add_argument("--runs", type=int, default=1, help="Number of evaluation runs (default: 1)")
+    p_run.add_argument("--seed", type=int, default=1337, help="Evaluation seed (default: 1337)")
+    p_run.add_argument("--limit", type=int, default=None, help="Optional limit K of cases to run")
+    p_run.add_argument(
+        "--datasets-dir",
+        type=str,
+        default=str(DEFAULT_DATASETS_DIR),
+        help="Datasets root directory",
+    )
+    p_run.add_argument(
+        "--results-dir",
+        type=str,
+        default=str(DEFAULT_RESULTS_DIR),
+        help="Directory for run JSON outputs and checkpoints",
+    )
+    p_run.add_argument(
+        "--frozen",
+        type=str,
+        default=str(DEFAULT_FROZEN_FILE),
+        help="Path to FROZEN.json",
+    )
+    p_run.add_argument("--run-id", type=str, default=None, help="Optional explicit run identifier")
+
     args = parser.parse_args(argv)
     if args.command == "build":
         return cmd_build(args)
@@ -213,6 +271,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_freeze(args)
     elif args.command == "verify-frozen":
         return cmd_verify_frozen(args)
+    elif args.command == "run":
+        return cmd_run(args)
     return 1
 
 

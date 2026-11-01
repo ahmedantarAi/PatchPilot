@@ -5,9 +5,9 @@
 #
 # Compose memory budget (mem_limit), ceiling 6144 MB:
 #   core:           qdrant 512                                              =  512 MB
-#   observability:  web 1024 + worker 768 + clickhouse 1280
-#                   + postgres 384 + redis 128 + minio 256                  = 3840 MB
-#   total                                                                   = 4352 MB
+#   observability:  web 1280 + worker 768 + clickhouse 1280
+#                   + postgres 384 + redis 128 + minio 256                  = 4096 MB
+#   total                                                                   = 4608 MB
 # Sandbox runs are sequential (max one at a time) and are not counted here (SPEC.md section 8).
 # Langfuse secrets default to empty so core starts without them; `obs-up` checks them first.
 # Docker Desktop's WSL2 VM should be allowed >= 6 GB (see README).
@@ -29,7 +29,7 @@ services:
   langfuse-web:
     profiles: [observability]
     image: docker.langfuse.com/langfuse/langfuse:4.72.0
-    mem_limit: 1024m
+    mem_limit: 1280m
     restart: unless-stopped
     depends_on: &langfuse-depends
       langfuse-postgres: {condition: service_healthy}
@@ -39,6 +39,7 @@ services:
     ports:
       - "127.0.0.1:3000:3000"
     environment: &langfuse-env
+      NODE_OPTIONS: "--max-old-space-size=1024"
       NEXTAUTH_URL: ${LANGFUSE_HOST:-http://localhost:3000}
       NEXTAUTH_SECRET: ${LANGFUSE_NEXTAUTH_SECRET:-}
       SALT: ${LANGFUSE_SALT:-}
@@ -85,7 +86,9 @@ services:
     depends_on: *langfuse-depends
     ports:
       - "127.0.0.1:3030:3030"
-    environment: *langfuse-env
+    environment:
+      <<: *langfuse-env
+      NODE_OPTIONS: "--max-old-space-size=512"
 
   langfuse-clickhouse:
     profiles: [observability]

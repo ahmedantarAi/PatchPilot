@@ -70,3 +70,49 @@ class Settings(BaseSettings):
                     raise ValueError(f"duplicate variable {dups[0]!r} found in {p}")
 
         super().__init__(**values)
+
+
+class LangfuseSettings(BaseSettings):
+    """Environment-driven settings for optional Langfuse v4 observability."""
+
+    model_config = SettingsConfigDict(
+        env_prefix="LANGFUSE_",
+        env_file=(ENV_FILE, ".env"),
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    host: str = "http://localhost:3000"
+    public_key: str = ""
+    secret_key: str = ""
+    init_project_public_key: str = ""
+    init_project_secret_key: str = ""
+
+    @property
+    def effective_public_key(self) -> str:
+        return (self.public_key or self.init_project_public_key).strip()
+
+    @property
+    def effective_secret_key(self) -> str:
+        return (self.secret_key or self.init_project_secret_key).strip()
+
+    @property
+    def is_configured(self) -> bool:
+        pub = self.effective_public_key
+        sec = self.effective_secret_key
+        host = self.host.strip()
+        if not host or not pub or not sec:
+            return False
+        if "CHANGEME" in pub or "CHANGEME" in sec:
+            return False
+        return True
+
+    def __repr__(self) -> str:
+        return (
+            f"LangfuseSettings(host={self.host!r}, "
+            f"public_key={self.effective_public_key!r}, "
+            "secret_key='***REDACTED***')"
+        )
+
+    def __str__(self) -> str:
+        return self.__repr__()

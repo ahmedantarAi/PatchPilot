@@ -205,16 +205,14 @@ each case's verification result keyed by a hash of the case contents and the san
   fed back to `propose`. Each case indexes into a per-case Qdrant collection named from its content hash
   and deletes the collection after the run.
 
-**Freeze.** The eval split (all eval-only pools) is **frozen before any tuning, prompt iteration or
+**Freeze & eval integrity (fail closed).** The eval split (all eval-only pools) is **frozen before any tuning, prompt iteration or
 training starts**: `evals freeze` writes `evals/FROZEN.json` (case ids, per-case content hashes, generator
-version, seed ranges, overall sha256). It is committed. `evals verify-frozen` runs in CI and fails on any
-change; changing the eval set requires a new dataset version and a DECISIONS.md entry, and invalidates
-earlier comparisons.
+version, seed ranges, overall sha256). It is committed. `evals verify-frozen` runs in CI and automatically before any `seeded_eval` run in the eval runner, failing closed on any mismatch; changing the eval set requires a new dataset version and a DECISIONS.md entry, and invalidates earlier comparisons. Prompt development is allowed on `seeded_train` only; every run records `prompt_version_hash` (SHA-256 of the prompt templates) and the runner refuses to publish a summary if `prompt_version_hash` changed across runs of the same comparison.
 
 **Metrics.** Patch applies cleanly; target failing test passes; no previously passing test regresses
 (`pass@1` on attempt 1 and `pass@k` at fixed `k = 3` across the bounded retry loop); review
 precision/recall on `findings_eval`; sandbox containment; tokens and latency per provider. Reports
-include run count, seed, model version and confidence intervals; ≥ 3 runs per configuration because LLMs
+include run count, seed, model version, `prompt_version_hash`, and 95% Wilson score confidence intervals, plus breakdowns by bug class (`taxonomy`) and by `template` (explicitly noting that `seeded_eval` has only 14 templates); ≥ 3 runs per configuration for full baseline comparisons because LLMs
 are nondeterministic.
 
 **QLoRA distillation handoff (Phase 8).** Training dependencies (`torch`, `transformers`, `peft`,
@@ -223,18 +221,22 @@ standalone Colab notebook that fine-tunes `Qwen2.5-Coder-7B`, exports a quantize
 registers the model in local Ollama (`ollama create`) so `evals compare` evaluates both baseline and
 candidate through `OllamaProvider`.
 
-**Layout.** `evals/datasets/<pool>/<case_id>/{repo/,meta.json}`; results in `evals/results/<run_id>/`
-(gitignored; summaries committed and cited by run id). CI runs only a tiny mock-provider eval for
+**Layout.** `evals/datasets/<pool>/<case_id>/{repo/,meta.json}`; results in `evals/results/`
+(gitignored; per-`(case, run, config)` resumable checkpoints under `evals/results/checkpoints/<config_hash>/`; summaries committed and cited by run id). CI runs only a tiny mock-provider eval for
 plumbing, never model quality.
 
 ## 8. Resource budget
-- **Compose total ≤ 6144 MB** via per-service `mem_limit`: Qdrant 512 MB + observability 3840 MB
-  (web 1024, worker 768, ClickHouse 1280, Postgres 384, Redis 128, MinIO 256) = **4352 MB**.
+- **Compose total ≤ 6144 MB** via per-service `mem_limit`: Qdrant 512 MB + observability 4096 MB
+  (`langfuse-web` 1280 MB with `NODE_OPTIONS="--max-old-space-size=1024"`, `langfuse-worker` 768 MB with `NODE_OPTIONS="--max-old-space-size=512"`, ClickHouse 1280 MB, Postgres 384 MB, Redis 128 MB, MinIO 256 MB) = **4608 MB**.
 - **Sandbox runs are sequential, at most one at a time, and are not counted in the Compose total.**
   Each run is capped at 768 MB RAM / 1 CPU (§6); the orchestrator holds a single-run lock.
-- Host processes (FastAPI, orchestrator, Ollama and its VRAM/RAM) are outside Compose. The 8 GB VRAM
-  bounds usable local models. These are *limits*, not measurements. With the Compose stack at its
-  ceiling, one sandbox and the host processes, total demand against 16 GB host RAM is unmeasured.
+- **Measured memory usage (Phase 5, `obs-up` + Ollama `qwen2.5-coder:7b` loaded during 5-case `seeded_train` live run):**
+  - **Docker containers (`docker stats --no-stream`):** `langfuse-clickhouse` 891.0 MiB / 1280 MiB (69.6%), `langfuse-web` 717.6 MiB / 1280 MiB (56.1%), `langfuse-worker` 336.1 MiB / 768 MiB (43.8%), `langfuse-postgres` 110.8 MiB / 384 MiB (28.9%), `langfuse-minio` 101.0 MiB / 256 MiB (39.5%), `qdrant` 90.2 MiB / 512 MiB (17.6%), `langfuse-redis` 11.9 MiB / 128 MiB (9.3%) — **total active container RAM = 2258.7 MiB (~2.21 GiB)**.
+  - **Host OS & processes (`Win32_OperatingSystem` / Task Manager equivalent):** `vmmemWSL` 5129.4 MB working set (5420.4 MB private, bounded by the 6 GB `.wslconfig` WSL2 limit), `ollama` host process 76.8 MB working set (91.3 MB private; `qwen2.5-coder:7b` Q4_K_M weights ~4.7 GB reside in the 8 GB RTX 4060 GPU VRAM), Docker Desktop backend processes ~276.1 MB working set; **total Windows host RAM in use = 14560.9 MB / 16011.2 MB (1450.3 MB free)**.
+- **Safe benchmark execution on 16 GB host RAM (with a 6 GB WSL2 limit):**
+  1. **Keep Ollama in GPU VRAM (`OLLAMA_NUM_PARALLEL=1`, `OLLAMA_MAX_LOADED_MODELS=1`):** Ensures `qwen2.5-coder:7b` stays offloaded to the 8 GB RTX 4060 VRAM (~77 MB host RAM working set) instead of spilling into system RAM.
+  2. **Sequential sandbox lock (`768 MB` cap):** At most one verification container runs at any moment, so peak container footprint with `obs-up` is `~2.26 GiB + 0.75 GiB ≈ 3.01 GiB`, staying inside the 6 GB WSL2 ceiling.
+  3. **Run large multi-run benchmarks with `obs-down` (only `qdrant` up via `.\tasks.ps1 up`):** When full Langfuse UI/ClickHouse ingestion is not needed, stopping the observability profile reduces active container RAM from `2258.7 MiB` to `~90 MiB` (`qdrant` only), while `PatchPilotTracer` gracefully no-ops and `evals run` still records full per-call tokens, latency, `trace_id`, and atomic per-`(case, run, config)` checkpoints in `evals/results/`.
 
 ## 9. Security, privacy & secrets
 - **Never send private code to the Gemini free tier.** Free-tier inputs may be used by Google to improve

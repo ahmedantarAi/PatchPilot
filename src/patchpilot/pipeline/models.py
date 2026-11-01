@@ -5,6 +5,7 @@ from __future__ import annotations
 from pydantic import BaseModel, Field
 
 from patchpilot.providers.base import DataClass
+from patchpilot.tracing import LLMCallMetric, SandboxRunMetric
 
 
 class Finding(BaseModel):
@@ -40,11 +41,15 @@ class PipelineState(BaseModel):
     provider: str = "mock"
     data_class: DataClass = "private"
     reported_patch: str = ""
-    tokens: dict[str, int] = Field(
-        default_factory=lambda: {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-    )
-    llm_latencies: list[float] = Field(default_factory=list)
+    trace_id: str = ""
+    prompt_version_hash: str = ""
     model_name: str = ""
+    llm_calls: list[LLMCallMetric] = Field(default_factory=list)
+    sandbox_runs: list[SandboxRunMetric] = Field(default_factory=list)
+    total_prompt_tokens: int = 0
+    total_completion_tokens: int = 0
+    total_tokens: int = 0
+    total_latency_s: float = 0.0
 
 
 class PipelineRunSummary(BaseModel):

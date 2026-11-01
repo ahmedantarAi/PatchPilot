@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
 import logging
 import subprocess
 import sys
 import tempfile
+import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any, Literal
@@ -22,10 +24,47 @@ from patchpilot.pipeline.normalization import (
 from patchpilot.providers.base import LLMProvider, LLMRequest, Message, ProviderError
 from patchpilot.retrieval import Embedder, QdrantStore, case_collection_name
 from patchpilot.sandbox.runner import SandboxResult, SandboxRunner
+from patchpilot.tracing import PatchPilotTracer
 
 logger = logging.getLogger("patchpilot.pipeline")
 
 VerifyCallable = Callable[[dict[str, str], str], Awaitable[SandboxResult]]
+
+ANALYZE_PROMPT_TEMPLATE: tuple[str, ...] = (
+    "You are PatchPilot static analysis and fault localization engine.",
+    (
+        "Localize the fault across the repository's non-test Python files using "
+        "the failing test output and file contents."
+    ),
+    "For multi-file repositories, choose the non-test .py file that contains the defect.",
+    "Emit findings as lines in format: FINDING: <file>:<line>: <category>: <explanation>",
+)
+
+PROPOSE_PROMPT_TEMPLATE: tuple[str, ...] = (
+    "You are PatchPilot, an autonomous automated code repair agent.",
+    "Fix the bug in the repository's non-test .py file(s) so that all tests pass.",
+    (
+        "Never modify test files (test_*.py, *_test.py, anything under tests/, "
+        "conftest.py) or non-.py files."
+    ),
+    "Provide your fix as SEARCH/REPLACE blocks formatted as:",
+    "<<<<<<< SEARCH:<path/to/file.py>",
+    "<exact original lines to replace>",
+    "=======",
+    "<replacement lines>",
+    ">>>>>>> REPLACE",
+    "(A raw unified diff is also accepted.)",
+)
+
+
+def compute_prompt_version_hash() -> str:
+    """Compute a deterministic SHA-256 hash of the active pipeline prompt templates."""
+    hasher = hashlib.sha256()
+    hasher.update(b"analyze:\n")
+    hasher.update("\n".join(ANALYZE_PROMPT_TEMPLATE).encode("utf-8"))
+    hasher.update(b"\npropose:\n")
+    hasher.update("\n".join(PROPOSE_PROMPT_TEMPLATE).encode("utf-8"))
+    return hasher.hexdigest()
 
 
 def run_ast_parse(files: dict[str, str]) -> list[Finding]:
@@ -126,20 +165,14 @@ async def run_llm_diff_analysis(
     findings: list[Finding],
     failing_test_output: str = "",
     retrieved_context: list[str] | None = None,
+    tracer: PatchPilotTracer | None = None,
+    parent_span_id: str | None = None,
 ) -> list[Finding]:
     """Perform LLM fault localization and inspection without ground-truth file hints."""
     non_test_py_files = [p for p in sorted(files) if is_modifiable_py_file(p)]
     test_files = [p for p in sorted(files) if is_test_file(p)]
 
-    prompt_lines = [
-        "You are PatchPilot static analysis and fault localization engine.",
-        (
-            "Localize the fault across the repository's non-test Python files using "
-            "the failing test output and file contents."
-        ),
-        "For multi-file repositories, choose the non-test .py file that contains the defect.",
-        "Emit findings as lines in format: FINDING: <file>:<line>: <category>: <explanation>",
-    ]
+    prompt_lines = list(ANALYZE_PROMPT_TEMPLATE)
     if non_test_py_files:
         prompt_lines.append("Repository non-test .py files:")
         for p in non_test_py_files:
@@ -172,8 +205,20 @@ async def run_llm_diff_analysis(
         data_class=data_class,
     )
     llm_findings: list[Finding] = []
+    t0 = time.perf_counter()
     try:
         resp = await provider.generate(req)
+        latency_s = time.perf_counter() - t0
+        if tracer is not None:
+            tracer.record_llm_call(
+                node="analyze",
+                model=resp.model,
+                provider=resp.provider,
+                prompt_tokens=resp.usage.prompt_tokens,
+                completion_tokens=resp.usage.completion_tokens,
+                latency_s=latency_s,
+                parent_span_id=parent_span_id,
+            )
         for line in resp.text.splitlines():
             stripped = line.strip()
             if stripped.startswith("FINDING:"):
@@ -220,10 +265,20 @@ def create_analyze_node(
     qdrant: QdrantStore | None = None,
     embedder: Embedder | None = None,
     sandbox_runner: SandboxRunner | None = None,
+    tracer: PatchPilotTracer | None = None,
 ) -> Callable[[PipelineState], Awaitable[dict[str, Any]]]:
     """Create the analyze node pure function over PipelineState."""
 
     async def analyze_node(state: PipelineState) -> dict[str, Any]:
+        span_id: str | None = None
+        perf_start = 0.0
+        iso_start = ""
+        if tracer is not None:
+            span_id, perf_start, iso_start = tracer.start_node_span(
+                "analyze",
+                {"case_id": state.case_id, "file_count": len(state.files)},
+            )
+
         # 1. ast.parse
         ast_findings = run_ast_parse(state.files)
 
@@ -236,12 +291,27 @@ def create_analyze_node(
         failing_test_output = state.failing_test_output
         if not failing_test_output and sandbox_runner is not None:
             try:
+                t_sb = time.perf_counter()
                 init_res = await sandbox_runner.run(
                     files=state.files,
                     patch_diff="",
                     pytest_args=["-q"],
                 )
+                sb_dur = time.perf_counter() - t_sb
                 failing_test_output = f"{init_res.stdout}\n{init_res.stderr}".strip()
+                if tracer is not None:
+                    tracer.record_sandbox_run(
+                        node="analyze",
+                        exit_code=init_res.exit_code,
+                        duration_s=init_res.duration_s or sb_dur,
+                        patch_applied=init_res.patch_applied,
+                        passed=init_res.junit.passed,
+                        failures=init_res.junit.failures,
+                        errors=init_res.junit.errors,
+                        container_name=init_res.container_name,
+                        image_digest=init_res.image_digest,
+                        parent_span_id=span_id,
+                    )
             except Exception as exc:
                 logger.info("Initial sandbox test run skipped or failed in analyze: %s", exc)
 
@@ -284,8 +354,19 @@ def create_analyze_node(
             findings=all_findings,
             failing_test_output=failing_test_output,
             retrieved_context=retrieved_context,
+            tracer=tracer,
+            parent_span_id=span_id,
         )
         combined_findings = all_findings + llm_findings
+
+        if tracer is not None and span_id is not None:
+            tracer.end_node_span(
+                span_id,
+                "analyze",
+                perf_start,
+                iso_start,
+                {"findings_count": len(combined_findings)},
+            )
 
         return {
             "findings": combined_findings,
@@ -298,27 +379,23 @@ def create_analyze_node(
 
 def create_propose_node(
     provider: LLMProvider,
+    tracer: PatchPilotTracer | None = None,
 ) -> Callable[[PipelineState], Awaitable[dict[str, Any]]]:
     """Create the propose node pure function over PipelineState."""
 
     async def propose_node(state: PipelineState) -> dict[str, Any]:
+        span_id: str | None = None
+        perf_start = 0.0
+        iso_start = ""
+        if tracer is not None:
+            span_id, perf_start, iso_start = tracer.start_node_span(
+                "propose",
+                {"attempt": state.attempt + 1},
+            )
+
         non_test_py_files = [p for p in sorted(state.files) if is_modifiable_py_file(p)]
 
-        prompt_parts = [
-            "You are PatchPilot, an autonomous automated code repair agent.",
-            "Fix the bug in the repository's non-test .py file(s) so that all tests pass.",
-            (
-                "Never modify test files (test_*.py, *_test.py, anything under tests/, "
-                "conftest.py) or non-.py files."
-            ),
-            "Provide your fix as SEARCH/REPLACE blocks formatted as:",
-            "<<<<<<< SEARCH:<path/to/file.py>",
-            "<exact original lines to replace>",
-            "=======",
-            "<replacement lines>",
-            ">>>>>>> REPLACE",
-            "(A raw unified diff is also accepted.)",
-        ]
+        prompt_parts = list(PROPOSE_PROMPT_TEMPLATE)
         if non_test_py_files:
             prompt_parts.append("Candidate non-test .py files:")
             for p in non_test_py_files:
@@ -350,11 +427,25 @@ def create_propose_node(
             data_class=state.data_class,
         )
 
+        t0 = time.perf_counter()
         try:
             resp = await provider.generate(req)
+            latency_s = time.perf_counter() - t0
             raw_patch = resp.text
+            if tracer is not None:
+                tracer.record_llm_call(
+                    node="propose",
+                    model=resp.model,
+                    provider=resp.provider,
+                    prompt_tokens=resp.usage.prompt_tokens,
+                    completion_tokens=resp.usage.completion_tokens,
+                    latency_s=latency_s,
+                    parent_span_id=span_id,
+                )
         except ProviderError as exc:
             logger.warning("LLM generation failed in propose: %s", exc)
+            if tracer is not None and span_id is not None:
+                tracer.end_node_span(span_id, "propose", perf_start, iso_start, {"error": str(exc)})
             return {
                 "raw_patch": "",
                 "patch_diff": "",
@@ -363,6 +454,14 @@ def create_propose_node(
 
         try:
             canonical_diff = normalize_patch(raw_patch, state.files)
+            if tracer is not None and span_id is not None:
+                tracer.end_node_span(
+                    span_id,
+                    "propose",
+                    perf_start,
+                    iso_start,
+                    {"normalized": bool(canonical_diff.strip())},
+                )
             return {
                 "raw_patch": raw_patch,
                 "patch_diff": canonical_diff,
@@ -370,6 +469,8 @@ def create_propose_node(
             }
         except Exception as exc:
             logger.info("Patch normalization failed: %s", exc)
+            if tracer is not None and span_id is not None:
+                tracer.end_node_span(span_id, "propose", perf_start, iso_start, {"error": str(exc)})
             return {
                 "raw_patch": raw_patch,
                 "patch_diff": "",
@@ -382,14 +483,31 @@ def create_propose_node(
 def create_verify_node(
     sandbox_runner: SandboxRunner | None = None,
     verify_fn: VerifyCallable | None = None,
+    tracer: PatchPilotTracer | None = None,
 ) -> Callable[[PipelineState], Awaitable[dict[str, Any]]]:
     """Create the verify node pure function over PipelineState."""
 
     async def verify_node(state: PipelineState) -> dict[str, Any]:
         attempt = state.attempt + 1
+        span_id: str | None = None
+        perf_start = 0.0
+        iso_start = ""
+        if tracer is not None:
+            span_id, perf_start, iso_start = tracer.start_node_span(
+                "verify",
+                {"attempt": attempt},
+            )
 
         if not state.patch_diff.strip():
             reason = state.error or "No patch proposed or patch could not be normalized."
+            if tracer is not None and span_id is not None:
+                tracer.end_node_span(
+                    span_id,
+                    "verify",
+                    perf_start,
+                    iso_start,
+                    {"verified": False, "reason": reason},
+                )
             return {
                 "attempt": attempt,
                 "patch_applies": False,
@@ -405,6 +523,14 @@ def create_verify_node(
         try:
             validate_patch_targets(state.patch_diff)
         except ValueError as exc:
+            if tracer is not None and span_id is not None:
+                tracer.end_node_span(
+                    span_id,
+                    "verify",
+                    perf_start,
+                    iso_start,
+                    {"verified": False, "rejected": str(exc)},
+                )
             return {
                 "attempt": attempt,
                 "patch_applies": False,
@@ -417,6 +543,7 @@ def create_verify_node(
             }
 
         # Run verification in sandbox
+        t_sb = time.perf_counter()
         if verify_fn is not None:
             result = await verify_fn(state.files, state.patch_diff)
         else:
@@ -425,6 +552,21 @@ def create_verify_node(
                 files=state.files,
                 patch_diff=state.patch_diff,
                 pytest_args=["-q"],
+            )
+        sb_dur = time.perf_counter() - t_sb
+
+        if tracer is not None:
+            tracer.record_sandbox_run(
+                node="verify",
+                exit_code=result.exit_code,
+                duration_s=result.duration_s or sb_dur,
+                patch_applied=result.patch_applied,
+                passed=result.junit.passed,
+                failures=result.junit.failures,
+                errors=result.junit.errors,
+                container_name=result.container_name,
+                image_digest=result.image_digest,
+                parent_span_id=span_id,
             )
 
         patch_applies = bool(result.patch_applied)
@@ -456,6 +598,19 @@ def create_verify_node(
                 f"Error: {result.error}"
             )
 
+        if tracer is not None and span_id is not None:
+            tracer.end_node_span(
+                span_id,
+                "verify",
+                perf_start,
+                iso_start,
+                {
+                    "verified": verified,
+                    "patch_applies": patch_applies,
+                    "target_test_passes": tests_passed,
+                },
+            )
+
         return {
             "attempt": attempt,
             "patch_applies": patch_applies,
@@ -477,6 +632,36 @@ def should_retry(state: PipelineState) -> Literal["propose", "report"]:
     if state.attempt < state.max_attempts:
         return "propose"
     return "report"
+
+
+def create_report_node(
+    tracer: PatchPilotTracer | None = None,
+) -> Callable[[PipelineState], Awaitable[dict[str, Any]]]:
+    """Create the report node pure function over PipelineState."""
+
+    async def _report_node(state: PipelineState) -> dict[str, Any]:
+        span_id: str | None = None
+        perf_start = 0.0
+        iso_start = ""
+        if tracer is not None:
+            span_id, perf_start, iso_start = tracer.start_node_span(
+                "report",
+                {"verified": state.verified},
+            )
+
+        reported = state.patch_diff if state.verified else ""
+
+        if tracer is not None and span_id is not None:
+            tracer.end_node_span(
+                span_id,
+                "report",
+                perf_start,
+                iso_start,
+                {"reported": bool(reported)},
+            )
+        return {"reported_patch": reported}
+
+    return _report_node
 
 
 async def report_node(state: PipelineState) -> dict[str, Any]:

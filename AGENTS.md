@@ -11,3 +11,4 @@
 9. Keep `Makefile` and `tasks.ps1` in sync.
 10. Before finishing a change run `.\tasks.ps1 check` and `.\tasks.ps1 config`.
 11. Never commit `.env` or secrets.
+12. Prompt development is allowed on `seeded_train` only; never read per-case `seeded_eval` results while editing prompts.

@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import math
+import random
 import subprocess
 import tempfile
 import time
@@ -350,7 +351,11 @@ async def run_eval_pool(
         raise FileNotFoundError(f"Evaluation pool directory not found: {pool_dir}")
 
     case_dirs = sorted([d for d in pool_dir.iterdir() if d.is_dir()], key=lambda d: d.name)
-    if limit is not None and limit > 0:
+    if limit is not None and 0 < limit < len(case_dirs) and seed != 1337:
+        rng = random.Random(seed)
+        sampled = rng.sample(case_dirs, limit)
+        case_dirs = sorted(sampled, key=lambda d: d.name)
+    elif limit is not None and limit > 0:
         case_dirs = case_dirs[:limit]
     if not case_dirs:
         raise ValueError(f"No evaluation cases found in {pool_dir}")

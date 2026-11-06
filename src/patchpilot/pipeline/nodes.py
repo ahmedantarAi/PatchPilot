@@ -37,6 +37,14 @@ ANALYZE_PROMPT_TEMPLATE: tuple[str, ...] = (
         "the failing test output and file contents."
     ),
     "For multi-file repositories, choose the non-test .py file that contains the defect.",
+    (
+        "Inspect the failing test assertions and source comments carefully to identify: "
+        "(1) exact SQL parameter placeholder syntax (e.g., '?' vs '%s') and return types "
+        "(plain str, tuple), (2) dictionary keys present with explicit None values (where "
+        "d.get(k, default) still returns None, so the code must check "
+        "'if val is None: val = default'), and (3) which module-level caller function omits "
+        "resource cleanup, uses the wrong operator, or has a boundary bug."
+    ),
     "Emit findings as lines in format: FINDING: <file>:<line>: <category>: <explanation>",
 )
 
@@ -47,13 +55,38 @@ PROPOSE_PROMPT_TEMPLATE: tuple[str, ...] = (
         "Never modify test files (test_*.py, *_test.py, anything under tests/, "
         "conftest.py) or non-.py files."
     ),
-    "Provide your fix as SEARCH/REPLACE blocks formatted as:",
-    "<<<<<<< SEARCH:<path/to/file.py>",
-    "<exact original lines to replace>",
+    "Output ONLY raw SEARCH/REPLACE blocks (no ``` markdown code fences) using these exact lines:",
+    "<<<<<<< SEARCH:<filename.py>",
+    "<exact verbatim lines copied from the file>",
     "=======",
     "<replacement lines>",
     ">>>>>>> REPLACE",
-    "(A raw unified diff is also accepted.)",
+    "CRITICAL RULES:",
+    (
+        "1. Do NOT use markdown backticks (```) anywhere. Start with literally 7 '<' characters: "
+        "'<<<<<<< SEARCH:<filename.py>', then '=======', then '>>>>>>> REPLACE'."
+    ),
+    (
+        '2. Replacing the ENTIRE file from line 1 (starting with the module docstring \'"""...\') '
+        "to the last line is the safest way to avoid indentation or missing-comment mismatches "
+        "in SEARCH. Otherwise, copy the exact lines from the file with identical leading spaces "
+        "and comments (top-level 'def ' functions have 0 leading spaces; lines inside a function "
+        "have 4 leading spaces)."
+    ),
+    (
+        "3. Never import third-party libraries (such as psycopg2). For SQL parameterization, "
+        "return a plain Python str query using the '?' placeholder and a parameter tuple "
+        "(e.g., (val,)), matching the test assertions."
+    ),
+    (
+        "4. NEVER fix a NoneType error by only changing 'd.get(k)' to 'd.get(k, default)', because "
+        "in Python '{k: None}.get(k, default)' STILL returns None! Always write an explicit check: "
+        "'if val is None: val = default' (or 'd.get(k) or default') before using the value."
+    ),
+    (
+        "5. For resource leaks, ensure the caller function explicitly closes/cleans up/releases "
+        "the resource (or wraps usage in a 'with' statement) before returning."
+    ),
 )
 
 

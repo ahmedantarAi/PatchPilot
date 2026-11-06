@@ -72,7 +72,7 @@ Expected: `9 passed` — covers task-difficulty routing (`StaticRulePolicy` weak
 uv run --frozen python -m patchpilot review --repo-dir tests/fixtures/pr_demo --dry-run --provider mock
 ```
 Expected: `findings=2 verified_patches=1 comments_posted=0 (dry-run)` for the fixture PR (counts are properties
-of the fixture). Live posting to a throwaway test repo is a separate manual step requiring your OK.
+of the fixture). Live posting to a throwaway test repo is a separate manual step requiring your OK. Actual output: `findings=2 verified_patches=1 comments_posted=0 (dry-run)` (verified 2026-11-06).
 
 ## Phase 8 — QLoRA distillation on Colab, tuned-vs-baseline comparison
 ```powershell

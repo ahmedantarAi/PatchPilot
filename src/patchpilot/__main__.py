@@ -125,6 +125,34 @@ async def _trace_smoke_command() -> int:
     return 0
 
 
+async def _review_command(
+    repo_dir: str | None,
+    repo: str | None,
+    pr_number: int | None,
+    dry_run: bool,
+    provider_name: str,
+    report_out: str | None,
+) -> int:
+    from patchpilot.review.github import GitHubError
+    from patchpilot.review.runner import run_review
+
+    try:
+        res = await run_review(
+            repo_dir=Path(repo_dir) if repo_dir else None,
+            repo=repo,
+            pr_number=pr_number,
+            dry_run=dry_run,
+            provider_name=provider_name,
+            report_out=Path(report_out) if report_out else None,
+        )
+    except (GitHubError, ValueError, FileNotFoundError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    print(res.summary_line())
+    return 0
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(prog="patchpilot", description="PatchPilot CLI")
     subparsers = parser.add_subparsers(dest="subcommand", required=True)
@@ -143,6 +171,43 @@ def main() -> None:
         help="Verify Langfuse trace ingestion/visibility or degrade to no-op when down",
     )
 
+    review_parser = subparsers.add_parser(
+        "review",
+        help="Review a local repository directory or a GitHub Pull Request",
+    )
+    review_parser.add_argument(
+        "--repo-dir",
+        default=None,
+        help="Local repository directory to review (offline / CI mode)",
+    )
+    review_parser.add_argument(
+        "--repo",
+        default=None,
+        help="GitHub repository ('owner/repo' or URL) or local path",
+    )
+    review_parser.add_argument(
+        "--pr",
+        type=int,
+        default=None,
+        help="GitHub Pull Request number (used with --repo)",
+    )
+    review_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Verify patches and format comments without posting to GitHub",
+    )
+    review_parser.add_argument(
+        "--provider",
+        default="router",
+        choices=["mock", "ollama", "gemini", "router"],
+        help="LLM provider name (default: router)",
+    )
+    review_parser.add_argument(
+        "--out",
+        default=None,
+        help="Optional path to write full JSON review report",
+    )
+
     args = parser.parse_args()
 
     if args.subcommand == "run":
@@ -150,6 +215,18 @@ def main() -> None:
         sys.exit(exit_code)
     elif args.subcommand == "trace-smoke":
         exit_code = asyncio.run(_trace_smoke_command())
+        sys.exit(exit_code)
+    elif args.subcommand == "review":
+        exit_code = asyncio.run(
+            _review_command(
+                repo_dir=args.repo_dir,
+                repo=args.repo,
+                pr_number=args.pr,
+                dry_run=bool(args.dry_run),
+                provider_name=args.provider,
+                report_out=args.out,
+            )
+        )
         sys.exit(exit_code)
     else:
         sys.exit(1)

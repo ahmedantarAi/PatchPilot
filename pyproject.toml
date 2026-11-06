@@ -27,6 +27,7 @@ package = false  # source is run from src/ via PYTHONPATH; not built as a wheel 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
+norecursedirs = ["fixtures"]
 addopts = "-m 'not live and not docker'"
 markers = [
     "live: calls live external LLM providers (deselected by default; run with -m live)",
@@ -37,7 +38,7 @@ markers = [
 line-length = 100
 target-version = "py311"
 src = ["src", "tests"]
-extend-exclude = ["evals/datasets"]
+extend-exclude = ["evals/datasets", "tests/fixtures"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]

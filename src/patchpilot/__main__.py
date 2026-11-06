@@ -134,7 +134,7 @@ def main() -> None:
     run_parser.add_argument(
         "--provider",
         default="mock",
-        choices=["mock", "ollama", "gemini"],
+        choices=["mock", "ollama", "gemini", "router"],
         help="LLM provider name (default: mock)",
     )
 

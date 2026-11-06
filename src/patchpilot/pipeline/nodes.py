@@ -243,6 +243,7 @@ async def run_llm_diff_analysis(
         resp = await provider.generate(req)
         latency_s = time.perf_counter() - t0
         if tracer is not None:
+            last_dec = getattr(provider, "last_decision", None)
             tracer.record_llm_call(
                 node="analyze",
                 model=resp.model,
@@ -251,6 +252,11 @@ async def run_llm_diff_analysis(
                 completion_tokens=resp.usage.completion_tokens,
                 latency_s=latency_s,
                 parent_span_id=parent_span_id,
+                route_target=getattr(last_dec, "route_target", ""),
+                decision_reason=getattr(last_dec, "decision_reason", ""),
+                fallback_used=bool(getattr(last_dec, "fallback_used", False)),
+                warning_flag=getattr(last_dec, "warning_flag", ""),
+                estimated_cost_usd=float(getattr(last_dec, "estimated_cost_usd", 0.0)),
             )
         for line in resp.text.splitlines():
             stripped = line.strip()
@@ -466,6 +472,7 @@ def create_propose_node(
             latency_s = time.perf_counter() - t0
             raw_patch = resp.text
             if tracer is not None:
+                last_dec = getattr(provider, "last_decision", None)
                 tracer.record_llm_call(
                     node="propose",
                     model=resp.model,
@@ -474,6 +481,11 @@ def create_propose_node(
                     completion_tokens=resp.usage.completion_tokens,
                     latency_s=latency_s,
                     parent_span_id=span_id,
+                    route_target=getattr(last_dec, "route_target", ""),
+                    decision_reason=getattr(last_dec, "decision_reason", ""),
+                    fallback_used=bool(getattr(last_dec, "fallback_used", False)),
+                    warning_flag=getattr(last_dec, "warning_flag", ""),
+                    estimated_cost_usd=float(getattr(last_dec, "estimated_cost_usd", 0.0)),
                 )
         except ProviderError as exc:
             logger.warning("LLM generation failed in propose: %s", exc)

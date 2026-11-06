@@ -65,8 +65,7 @@ Expected: first run `trace_id=<32 hex> visible=true` (provisioned non-interactiv
 ```powershell
 uv run --frozen pytest tests/test_router.py -q
 ```
-Expected: `9 passed` — covers task-difficulty routing, Gemini quota exhaustion → Ollama fallback, provider
-failure fallback, and that private-data requests (`data_class="private"`) are never routed to Gemini.
+Expected: `9 passed` — covers task-difficulty routing (`StaticRulePolicy` weak-spot heuristics for `none_handling` / `sql_injection` and AST complexity thresholds, plus `CascadeConfidencePolicy` retry escalation), Gemini quota exhaustion (HTTP 429) → Ollama fallback with trace warning flag, network timeout fallback, private-data requests (`data_class="private"`) forced to local Ollama (`SPEC §9`), end-to-end pipeline + cost/latency telemetry integration, and a 10-case `seeded_train` smoke benchmark (`69.81%` cost savings vs. 100% Gemini, `10/10` `pass@1`). Actual output: `9 passed in 7.01s` (verified 2026-11-06).
 
 ## Phase 7 — GitHub PR integration
 ```powershell

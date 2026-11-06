@@ -42,6 +42,11 @@ class LLMCallMetric(BaseModel):
     completion_tokens: int = 0
     total_tokens: int = 0
     latency_s: float = 0.0
+    route_target: str = ""
+    decision_reason: str = ""
+    fallback_used: bool = False
+    warning_flag: str = ""
+    estimated_cost_usd: float = 0.0
 
 
 class SandboxRunMetric(BaseModel):
@@ -235,6 +240,11 @@ class PatchPilotTracer:
         parent_span_id: str | None = None,
         start_time: str | None = None,
         end_time: str | None = None,
+        route_target: str = "",
+        decision_reason: str = "",
+        fallback_used: bool = False,
+        warning_flag: str = "",
+        estimated_cost_usd: float = 0.0,
     ) -> LLMCallMetric:
         """Record an LLM generation call with model, token counts, and latency."""
         total_tok = prompt_tokens + completion_tokens
@@ -246,6 +256,11 @@ class PatchPilotTracer:
             completion_tokens=completion_tokens,
             total_tokens=total_tok,
             latency_s=round(max(0.0, latency_s), 6),
+            route_target=route_target,
+            decision_reason=decision_reason,
+            fallback_used=fallback_used,
+            warning_flag=warning_flag,
+            estimated_cost_usd=estimated_cost_usd,
         )
         self.llm_calls.append(metric)
 
@@ -256,6 +271,29 @@ class PatchPilotTracer:
             if parent_span_id and len(parent_span_id) >= 16
             else self.root_span_id
         )
+        attrs = [
+            _otel_attr("langfuse.observation.type", "generation"),
+            _otel_attr("gen_ai.system", provider),
+            _otel_attr("gen_ai.request.model", model),
+            _otel_attr("gen_ai.response.model", model),
+            _otel_attr("gen_ai.usage.input_tokens", prompt_tokens),
+            _otel_attr("gen_ai.usage.output_tokens", completion_tokens),
+            _otel_attr("gen_ai.usage.total_tokens", total_tok),
+            _otel_attr("patchpilot.node", node),
+            _otel_attr("patchpilot.latency_s", metric.latency_s),
+        ]
+        if route_target:
+            attrs.append(_otel_attr("patchpilot.router.target", route_target))
+        if decision_reason:
+            attrs.append(_otel_attr("patchpilot.router.reason", decision_reason))
+        if fallback_used:
+            attrs.append(_otel_attr("patchpilot.router.fallback", fallback_used))
+        if warning_flag:
+            attrs.append(_otel_attr("patchpilot.router.warning", warning_flag))
+            attrs.append(_otel_attr("langfuse.observation.level", "WARNING"))
+        if estimated_cost_usd > 0.0:
+            attrs.append(_otel_attr("patchpilot.router.estimated_cost_usd", estimated_cost_usd))
+
         self._otel_spans.append(
             {
                 "traceId": self.trace_id,
@@ -265,17 +303,7 @@ class PatchPilotTracer:
                 "kind": 3,
                 "startTimeUnixNano": str(start_ns),
                 "endTimeUnixNano": str(end_ns),
-                "attributes": [
-                    _otel_attr("langfuse.observation.type", "generation"),
-                    _otel_attr("gen_ai.system", provider),
-                    _otel_attr("gen_ai.request.model", model),
-                    _otel_attr("gen_ai.response.model", model),
-                    _otel_attr("gen_ai.usage.input_tokens", prompt_tokens),
-                    _otel_attr("gen_ai.usage.output_tokens", completion_tokens),
-                    _otel_attr("gen_ai.usage.total_tokens", total_tok),
-                    _otel_attr("patchpilot.node", node),
-                    _otel_attr("patchpilot.latency_s", metric.latency_s),
-                ],
+                "attributes": attrs,
             }
         )
         return metric

@@ -369,6 +369,8 @@ async def run_eval_pool(
         default_model_name = settings.ollama_model
     elif provider_name == "gemini":
         default_model_name = settings.gemini_model or "gemini"
+    elif provider_name == "router":
+        default_model_name = f"router({settings.ollama_model}+{settings.gemini_model or 'gemini'})"
     else:
         default_model_name = "mock-1"
 
@@ -397,7 +399,7 @@ async def run_eval_pool(
 
     embedder = (
         OllamaEmbedder(base_url=settings.ollama_base_url, model=settings.ollama_model)
-        if provider_name == "ollama" and provider_override is None
+        if provider_name in ("ollama", "router") and provider_override is None
         else HashEmbedder(dim=64)
     )
     qdrant = QdrantStore(base_url="http://127.0.0.1:6333", timeout_s=1.0)

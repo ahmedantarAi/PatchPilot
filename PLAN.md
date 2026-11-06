@@ -76,9 +76,11 @@ of the fixture). Live posting to a throwaway test repo is a separate manual step
 
 ## Phase 8 — QLoRA distillation on Colab, tuned-vs-baseline comparison
 ```powershell
+uv run --frozen python -m patchpilot.distillation export-train --output data/distillation_train.jsonl
 uv run --frozen python -m patchpilot.evals export-train --out evals/results/seeded_train.jsonl
-uv run --frozen python -m patchpilot.evals compare --baseline <run_id_a> --candidate <run_id_b>
+uv run --frozen python -m patchpilot.distillation compare --baseline <run_id_a> --candidate <run_id_b>
+uv run --frozen pytest tests/test_distillation.py -q
 ```
-Expected: `export-train` writes `seeded_train` (360 cases) as JSONL for the standalone Colab QLoRA notebook (which exports a quantized GGUF + `Modelfile` registered in local Ollama via `ollama create` so both baseline and candidate run through `OllamaProvider` with no training deps in `pyproject.toml`). `compare` prints header lines `frozen split: OK (sha256=<64 hex>)` and `train/eval overlap: 0`, followed by a metrics table
+Expected: `export-train` writes `seeded_train` (360 cases) as ChatML JSONL (`sha256=610354bbc9db4e98963e652af58bb409453d9e2d4bc8119f94d1636b9470baea`, `train/eval overlap=0`) for the standalone Colab QLoRA notebook (`notebooks/train_qlora_colab.ipynb`, which exports a quantized `q4_k_m` GGUF + `Modelfile` registered in local Ollama via `ollama create` so both baseline and candidate run through `OllamaProvider` with no training deps in `pyproject.toml`). `compare` prints header lines `frozen split: OK (sha256=<64 hex>)` and `train/eval overlap: 0`, followed by a metrics table
 for both runs with `n_runs>=3` each. Training data comes only from `seeded_train`. Results may be quoted in the
-README only with the run ids printed here.
+README only with the run ids printed here. Actual output: `exported 360 seeded_train samples to data/distillation_train.jsonl sha256=610354bbc9db4e98963e652af58bb409453d9e2d4bc8119f94d1636b9470baea (train/eval overlap=0)` and `5 passed in 13.40s` (verified 2026-11-07).

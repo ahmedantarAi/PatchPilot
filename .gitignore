@@ -14,4 +14,5 @@ build/
 evals/datasets/
 evals/.cache/
 evals/results/
+data/
 *.log

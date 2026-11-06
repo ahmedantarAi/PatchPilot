@@ -7,6 +7,7 @@ import asyncio
 import sys
 from pathlib import Path
 
+from patchpilot.distillation.__main__ import cmd_compare, cmd_export_train
 from patchpilot.evals.freeze import freeze_eval_split, verify_frozen_eval_split
 from patchpilot.evals.generator import build_and_materialize_all
 from patchpilot.evals.runner import EvalIntegrityError, format_eval_summary, run_eval_pool
@@ -262,6 +263,72 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_run.add_argument("--run-id", type=str, default=None, help="Optional explicit run identifier")
 
+    # export-train (Phase 8)
+    p_export = subparsers.add_parser(
+        "export-train",
+        help="Export seeded_train dataset to ChatML JSONL for Colab QLoRA fine-tuning",
+    )
+    p_export.add_argument(
+        "--output",
+        "--out",
+        dest="output",
+        type=str,
+        default="data/distillation_train.jsonl",
+        help="Output JSONL path",
+    )
+    p_export.add_argument(
+        "--datasets-dir",
+        type=str,
+        default=str(DEFAULT_DATASETS_DIR),
+        help="Datasets root directory",
+    )
+    p_export.add_argument(
+        "--frozen",
+        type=str,
+        default=str(DEFAULT_FROZEN_FILE),
+        help="Path to FROZEN.json",
+    )
+
+    # compare (Phase 8)
+    p_compare = subparsers.add_parser(
+        "compare",
+        help="Compare baseline vs distilled candidate evaluation runs on seeded_eval",
+    )
+    p_compare.add_argument("--baseline", required=True, help="Baseline run ID prefix or JSON path")
+    p_compare.add_argument(
+        "--candidate", required=True, help="Candidate run ID prefix or JSON path"
+    )
+    p_compare.add_argument(
+        "--results-dir",
+        type=str,
+        default=str(DEFAULT_RESULTS_DIR),
+        help="Directory containing evaluation run JSON reports",
+    )
+    p_compare.add_argument(
+        "--datasets-dir",
+        type=str,
+        default=str(DEFAULT_DATASETS_DIR),
+        help="Datasets root directory",
+    )
+    p_compare.add_argument(
+        "--frozen",
+        type=str,
+        default=str(DEFAULT_FROZEN_FILE),
+        help="Path to FROZEN.json",
+    )
+    p_compare.add_argument(
+        "--min-runs",
+        type=int,
+        default=3,
+        help="Minimum number of runs required per configuration (default: 3)",
+    )
+    p_compare.add_argument(
+        "--out",
+        type=str,
+        default=None,
+        help="Optional path to write markdown comparison report",
+    )
+
     args = parser.parse_args(argv)
     if args.command == "build":
         return cmd_build(args)
@@ -273,6 +340,10 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_verify_frozen(args)
     elif args.command == "run":
         return cmd_run(args)
+    elif args.command == "export-train":
+        return cmd_export_train(args)
+    elif args.command == "compare":
+        return cmd_compare(args)
     return 1
 
 

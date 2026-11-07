@@ -14,6 +14,7 @@ from patchpilot.providers import (
     LLMProvider,
     MockProvider,
     OllamaProvider,
+    OpenRouterProvider,
     get_provider,
 )
 from patchpilot.providers.base import LLMRequest, Message
@@ -479,3 +480,63 @@ def test_router_smoke_benchmark_10_seeded_train_cases() -> None:
     assert report.router_metrics.cost_savings_pct > 50.0
     assert report.router.estimated_cost_usd < report.gemini_only.estimated_cost_usd
     assert report.router.simulated_latency_s < report.gemini_only.simulated_latency_s
+
+
+def test_router_with_openrouter_frontier() -> None:
+    """ModelRouter supports OpenRouterProvider as the frontier provider."""
+    openrouter_calls: list[httpx.Request] = []
+
+    async def no_sleep(_: float) -> None:
+        pass
+
+    local = OllamaProvider(
+        "http://localhost:11434",
+        "qwen2.5-coder:7b",
+        timeout_s=5.0,
+        transport=httpx.MockTransport(
+            lambda req: httpx.Response(200, json=_ollama_response_json())
+        ),
+        sleep=no_sleep,
+    )
+    frontier = OpenRouterProvider(
+        "fake-openrouter-key",
+        "google/gemma-4-31b-it:free",
+        timeout_s=5.0,
+        transport=httpx.MockTransport(
+            lambda req: (
+                openrouter_calls.append(req),
+                httpx.Response(
+                    200,
+                    json={
+                        "id": "gen-1",
+                        "model": "google/gemma-4-31b-it:free",
+                        "choices": [
+                            {"message": {"role": "assistant", "content": "OPENROUTER_PATCH"}}
+                        ],
+                        "usage": {"prompt_tokens": 50, "completion_tokens": 25},
+                    },
+                ),
+            )[1]
+        ),
+        sleep=no_sleep,
+    )
+    router = ModelRouter(local, frontier)
+    assert router.default_model == "router(ollama+openrouter)"
+
+    # Public complex request routed to frontier
+    complex_prompt = (
+        "--- File: test_service.py ---\n"
+        "def format_user_display_name(profile: dict) -> str:\n"
+        "    return profile.get('full_name', '')\n"
+        "def complex_sql_query(user_id: int):\n"
+        '    return f"SELECT * FROM data WHERE user_id = {user_id}"\n'
+    )
+    req = LLMRequest(
+        messages=[Message(role="user", content=complex_prompt)],
+        data_class="public",
+    )
+    resp = asyncio.run(router.generate(req))
+    assert resp.provider == "openrouter"
+    assert resp.text == "OPENROUTER_PATCH"
+    assert len(openrouter_calls) == 1
+    assert openrouter_calls[0].headers.get("authorization") == "Bearer fake-openrouter-key"

@@ -38,7 +38,7 @@ class ModelRouter:
         self.frontier_provider = frontier_provider
         self.policy: RoutingPolicy = policy or CascadeConfidencePolicy()
         self.decisions: list[RoutingDecision] = []
-        self.default_model = "router(ollama+gemini)"
+        self.default_model = f"router({self.local_provider.name}+{self.frontier_provider.name})"
 
     @property
     def last_decision(self) -> RoutingDecision | None:

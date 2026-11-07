@@ -10,6 +10,7 @@ from patchpilot.config import Settings
 from patchpilot.providers.base import (
     LLMRequest,
     LLMResponse,
+    PrivacyViolationError,
     ProviderError,
     SleepFn,
     Usage,
@@ -55,7 +56,7 @@ class GeminiProvider:
 
     async def generate(self, request: LLMRequest) -> LLMResponse:
         if request.data_class != "public":
-            raise ProviderError(
+            raise PrivacyViolationError(
                 f"gemini: refusing request with data_class={request.data_class!r}; "
                 "only 'public' is allowed (SPEC §9)"
             )

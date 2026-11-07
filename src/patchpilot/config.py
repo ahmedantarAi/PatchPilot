@@ -7,7 +7,8 @@ from typing import Any, Literal
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-ProviderName = Literal["ollama", "gemini", "mock", "router"]
+ProviderName = Literal["ollama", "gemini", "mock", "router", "openrouter"]
+FrontierProviderName = Literal["gemini", "openrouter"]
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 ENV_FILE = PROJECT_ROOT / ".env"
@@ -43,6 +44,10 @@ class Settings(BaseSettings):
     ollama_model: str = "qwen2.5-coder:7b"
     gemini_api_key: str = ""
     gemini_model: str = ""  # required when provider=gemini; set PP_GEMINI_MODEL in .env
+    openrouter_api_key: str = ""
+    openrouter_model: str = "google/gemma-4-31b-it:free"
+    openrouter_base_url: str = "https://openrouter.ai/api/v1"
+    frontier_provider: FrontierProviderName = "openrouter"
     request_timeout_s: float = 60.0
     max_attempts: int = 3
     retry_base_delay_s: float = 0.5

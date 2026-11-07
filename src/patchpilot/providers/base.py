@@ -45,6 +45,10 @@ class ProviderError(RuntimeError):
     """Raised for provider failures (network, quota, malformed response)."""
 
 
+class PrivacyViolationError(ProviderError):
+    """Raised when private code is sent to an external/untrusted provider (SPEC §9)."""
+
+
 @runtime_checkable
 class LLMProvider(Protocol):
     name: str

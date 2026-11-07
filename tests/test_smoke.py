@@ -16,7 +16,7 @@ def test_mock_provider_smoke() -> None:
     assert resp.usage.prompt_tokens == 3
 
 
-@pytest.mark.parametrize("name", ["ollama", "gemini"])
+@pytest.mark.parametrize("name", ["ollama", "gemini", "openrouter"])
 def test_real_providers_implement_protocol(name: str) -> None:
     provider = get_provider(name)
     assert isinstance(provider, LLMProvider)

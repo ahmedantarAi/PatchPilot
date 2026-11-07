@@ -10,6 +10,12 @@ from pathlib import Path
 from patchpilot.distillation.__main__ import cmd_compare, cmd_export_train
 from patchpilot.evals.freeze import freeze_eval_split, verify_frozen_eval_split
 from patchpilot.evals.generator import build_and_materialize_all
+from patchpilot.evals.realworld_mini import (
+    DEFAULT_FROZEN_REALWORLD_MINI,
+    build_and_verify_realworld_mini,
+    freeze_realworld_mini,
+    verify_frozen_realworld_mini,
+)
 from patchpilot.evals.runner import EvalIntegrityError, format_eval_summary, run_eval_pool
 from patchpilot.evals.taxonomy import (
     BASE_TEMPLATES,
@@ -135,6 +141,50 @@ def cmd_verify_frozen(args: argparse.Namespace) -> int:
     else:
         print(f"FAIL: {msg}", file=sys.stderr)
         return 1
+
+
+def cmd_build_realworld_mini(args: argparse.Namespace) -> int:
+    datasets_dir = Path(args.datasets_dir)
+    kept, dropped = build_and_verify_realworld_mini(datasets_dir=datasets_dir)
+    for res in kept:
+        print(
+            f"PASS {res.pool}/{res.case_id}: pre_fail={res.pre_fix_failed} "
+            f"patch_applied={res.patch_applied} post_pass={res.post_fix_passed} "
+            f"cached={res.cached} ({res.duration_s:.2f}s)"
+        )
+    for res in dropped:
+        print(
+            f"DROP {res.pool}/{res.case_id}: pre_fail={res.pre_fix_failed} "
+            f"patch_applied={res.patch_applied} post_pass={res.post_fix_passed} "
+            f"err={res.error}"
+        )
+    print(f"built realworld_mini={len(kept)} dropped={len(dropped)}")
+    return 0 if kept else 1
+
+
+def cmd_freeze_realworld_mini(args: argparse.Namespace) -> int:
+    datasets_dir = Path(args.datasets_dir)
+    frozen_file = Path(args.out)
+    manifest = freeze_realworld_mini(
+        datasets_dir=datasets_dir,
+        output_path=frozen_file,
+    )
+    print(f"wrote {frozen_file.as_posix()} sha256={manifest.overall_sha256}")
+    return 0
+
+
+def cmd_verify_frozen_realworld_mini(args: argparse.Namespace) -> int:
+    datasets_dir = Path(args.datasets_dir)
+    frozen_file = Path(args.frozen)
+    valid, msg = verify_frozen_realworld_mini(
+        frozen_path=frozen_file,
+        datasets_dir=datasets_dir,
+    )
+    if valid:
+        print(msg)
+        return 0
+    print(f"FAIL: {msg}", file=sys.stderr)
+    return 1
 
 
 def cmd_run(args: argparse.Namespace) -> int:
@@ -329,6 +379,54 @@ def main(argv: list[str] | None = None) -> int:
         help="Optional path to write markdown comparison report",
     )
 
+    # build-realworld-mini (Mini Phase 3b)
+    p_build_rw = subparsers.add_parser(
+        "build-realworld-mini",
+        help="Build and verify realworld_mini cases in the --network none sandbox",
+    )
+    p_build_rw.add_argument(
+        "--datasets-dir",
+        type=str,
+        default=str(DEFAULT_DATASETS_DIR),
+        help="Datasets root directory",
+    )
+
+    # freeze-realworld-mini
+    p_freeze_rw = subparsers.add_parser(
+        "freeze-realworld-mini",
+        help="Freeze realworld_mini pool to FROZEN_REALWORLD_MINI.json",
+    )
+    p_freeze_rw.add_argument(
+        "--datasets-dir",
+        type=str,
+        default=str(DEFAULT_DATASETS_DIR),
+        help="Datasets root directory",
+    )
+    p_freeze_rw.add_argument(
+        "--out",
+        type=str,
+        default=str(DEFAULT_FROZEN_REALWORLD_MINI),
+        help="Output FROZEN_REALWORLD_MINI.json path",
+    )
+
+    # verify-frozen-realworld-mini
+    p_verify_frozen_rw = subparsers.add_parser(
+        "verify-frozen-realworld-mini",
+        help="Verify realworld_mini dataset against FROZEN_REALWORLD_MINI.json",
+    )
+    p_verify_frozen_rw.add_argument(
+        "--datasets-dir",
+        type=str,
+        default=str(DEFAULT_DATASETS_DIR),
+        help="Datasets root directory",
+    )
+    p_verify_frozen_rw.add_argument(
+        "--frozen",
+        type=str,
+        default=str(DEFAULT_FROZEN_REALWORLD_MINI),
+        help="Path to FROZEN_REALWORLD_MINI.json",
+    )
+
     args = parser.parse_args(argv)
     if args.command == "build":
         return cmd_build(args)
@@ -338,6 +436,12 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_freeze(args)
     elif args.command == "verify-frozen":
         return cmd_verify_frozen(args)
+    elif args.command == "build-realworld-mini":
+        return cmd_build_realworld_mini(args)
+    elif args.command == "freeze-realworld-mini":
+        return cmd_freeze_realworld_mini(args)
+    elif args.command == "verify-frozen-realworld-mini":
+        return cmd_verify_frozen_realworld_mini(args)
     elif args.command == "run":
         return cmd_run(args)
     elif args.command == "export-train":

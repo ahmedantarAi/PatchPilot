@@ -19,6 +19,12 @@ from pydantic import BaseModel, Field
 from patchpilot.__main__ import _load_case_files, load_mock_ground_truth
 from patchpilot.config import LangfuseSettings, Settings
 from patchpilot.evals.freeze import verify_frozen_eval_split
+from patchpilot.evals.realworld_mini import (
+    DEFAULT_FROZEN_REALWORLD_MINI,
+    REALWORLD_MINI_POOL,
+    SPEC_BY_CASE_ID,
+    verify_frozen_realworld_mini,
+)
 from patchpilot.pipeline.graph import run_pipeline
 from patchpilot.pipeline.models import PipelineState
 from patchpilot.pipeline.nodes import VerifyCallable, compute_prompt_version_hash
@@ -56,6 +62,11 @@ class EvalCaseRunResult(BaseModel):
     prompt_tokens: int = 0
     completion_tokens: int = 0
     total_tokens: int = 0
+    max_call_prompt_tokens: int = 0
+    context_window_tokens: int = 32768
+    context_overflow: bool = False
+    borderline: bool = False
+    failure_cause: str = ""
     llm_calls: list[LLMCallMetric] = Field(default_factory=list)
     total_time_s: float = 0.0
     trace_id: str = ""
@@ -122,6 +133,7 @@ class EvalSummaryReport(BaseModel):
     by_taxonomy: list[BreakdownRow] = Field(default_factory=list)
     by_template: list[BreakdownRow] = Field(default_factory=list)
     run_files: list[str] = Field(default_factory=list)
+    cases: list[EvalCaseRunResult] = Field(default_factory=list)
 
 
 def wilson_ci_95(successes: int, total: int) -> tuple[float, float]:
@@ -252,6 +264,7 @@ def build_eval_summary(run_reports: list[EvalRunReport]) -> EvalSummaryReport:
         by_taxonomy=_compute_breakdown(all_cases, lambda c: c.taxonomy),
         by_template=_compute_breakdown(all_cases, lambda c: c.template),
         run_files=[rep.output_file for rep in run_reports if rep.output_file],
+        cases=all_cases,
     )
 
 
@@ -276,12 +289,19 @@ def format_eval_summary(summary: EvalSummaryReport) -> str:
             f"({summary.pass_at_3_rate:.1%}) "
             f"[95% Wilson CI: {p3_lo:.1%}, {p3_hi:.1%}]"
         ),
-        (
+    ]
+    if summary.pool == REALWORLD_MINI_POOL or summary.pool.startswith(REALWORLD_MINI_POOL):
+        overflow_cnt = sum(1 for c in summary.cases if c.context_overflow)
+        lines.append(
+            f"NOTE: {REALWORLD_MINI_POOL}, n={summary.total_observations}, small sample "
+            f"(context_overflow={overflow_cnt})."
+        )
+    elif summary.pool.startswith("seeded"):
+        lines.append(
             "NOTE: The eval pool (seeded_eval) has only 14 templates "
             "(2 per bug class across 7 classes; 42 templates are reserved for seeded_train)."
-        ),
-        "\nBreakdown by bug class (taxonomy):",
-    ]
+        )
+    lines.append("\nBreakdown by bug class (taxonomy):")
     for row in summary.by_taxonomy:
         r1_lo, r1_hi = row.pass_at_1_ci_95
         r3_lo, r3_hi = row.pass_at_3_ci_95
@@ -304,6 +324,23 @@ def format_eval_summary(summary: EvalSummaryReport) -> str:
             f"pass@3={row.pass_at_3_count}/{row.total} ({row.pass_at_3_rate:.1%}) "
             f"[{r3_lo:.1%}, {r3_hi:.1%}]"
         )
+
+    if (
+        summary.pool == REALWORLD_MINI_POOL or summary.pool.startswith(REALWORLD_MINI_POOL)
+    ) and summary.cases:
+        lines.append("\nPer-case outcomes (realworld_mini):")
+        for c in summary.cases:
+            tag = " [borderline]" if c.borderline else ""
+            overflow_tag = " [context overflow]" if c.context_overflow else ""
+            status = "PASS" if c.verified else "FAIL"
+            cause = f" | cause: {c.failure_cause}" if not c.verified and c.failure_cause else ""
+            lines.append(
+                f"  - {c.case_id}{tag}{overflow_tag} ({c.template}): {status} "
+                f"(pass@1={c.pass_at_1}, pass@3={c.pass_at_3}, attempts={c.attempts}, "
+                f"prompt_tokens={c.prompt_tokens}, "
+                f"max_call_prompt_tokens={c.max_call_prompt_tokens}/"
+                f"{c.context_window_tokens}, time={c.total_time_s:.1f}s){cause}"
+            )
 
     if summary.run_files:
         lines.append("\nWritten run JSON files:")
@@ -344,6 +381,21 @@ async def run_eval_pool(
         if not valid:
             raise EvalIntegrityError(
                 f"Fail-closed eval integrity check: verify-frozen failed before {pool} run: {msg}"
+            )
+    elif pool == REALWORLD_MINI_POOL or pool.startswith(REALWORLD_MINI_POOL):
+        rw_frozen = (
+            DEFAULT_FROZEN_REALWORLD_MINI
+            if frozen_path == Path("evals/FROZEN.json")
+            else frozen_path
+        )
+        valid, msg = verify_frozen_realworld_mini(
+            frozen_path=rw_frozen,
+            datasets_dir=datasets_dir,
+        )
+        if not valid:
+            raise EvalIntegrityError(
+                "Fail-closed eval integrity check: verify-frozen-realworld-mini failed "
+                f"before {pool} run: {msg}"
             )
 
     pool_dir = datasets_dir / pool
@@ -509,6 +561,26 @@ async def run_eval_pool(
 
             # Read taxonomy & template labels only AFTER the pipeline run completes
             taxonomy, template = _load_case_labels_after_run(cdir)
+            max_call_ptok = max((c.prompt_tokens for c in final_state.llm_calls), default=0)
+            ctx_window = 32768
+            is_overflow = max_call_ptok >= ctx_window
+            spec_obj = SPEC_BY_CASE_ID.get(case_id) if pool == REALWORLD_MINI_POOL else None
+            is_borderline = bool(spec_obj.borderline) if spec_obj is not None else False
+            fail_cause = ""
+            if is_overflow:
+                fail_cause = (
+                    f"context overflow (max_call_prompt_tokens={max_call_ptok} >= {ctx_window})"
+                )
+            elif not final_state.verified:
+                raw_fb = (final_state.feedback or "verification failed").strip()
+                fail_cause = raw_fb.splitlines()[0][:240] if raw_fb else "verification failed"
+
+            is_rw = pool == REALWORLD_MINI_POOL or pool.startswith(REALWORLD_MINI_POOL)
+            verified_final = (
+                final_state.verified and not is_overflow if is_rw else final_state.verified
+            )
+            p1_final = final_state.pass_at_1 and not is_overflow if is_rw else final_state.pass_at_1
+            p3_final = final_state.pass_at_k and not is_overflow if is_rw else final_state.pass_at_k
 
             case_result = EvalCaseRunResult(
                 case_id=case_id,
@@ -521,12 +593,17 @@ async def run_eval_pool(
                 model_name=final_state.model_name or str(default_model_name),
                 prompt_version_hash=final_state.prompt_version_hash or prompt_hash,
                 attempts=final_state.attempt,
-                verified=final_state.verified,
-                pass_at_1=final_state.pass_at_1,
-                pass_at_3=final_state.pass_at_k,
+                verified=verified_final,
+                pass_at_1=p1_final,
+                pass_at_3=p3_final,
                 prompt_tokens=final_state.total_prompt_tokens,
                 completion_tokens=final_state.total_completion_tokens,
                 total_tokens=final_state.total_tokens,
+                max_call_prompt_tokens=max_call_ptok,
+                context_window_tokens=ctx_window,
+                context_overflow=is_overflow,
+                borderline=is_borderline,
+                failure_cause=fail_cause,
                 llm_calls=list(final_state.llm_calls),
                 total_time_s=case_elapsed,
                 trace_id=final_state.trace_id,

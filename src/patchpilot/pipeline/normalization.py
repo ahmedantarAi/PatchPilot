@@ -116,6 +116,160 @@ def _strip_markdown_code_fences(text: str) -> str:
     return text
 
 
+def _strip_inline_comment(line: str) -> str:
+    """Strip trailing inline comments (# ...) not inside quotes."""
+    in_single = False
+    in_double = False
+    escaped = False
+    for i, ch in enumerate(line):
+        if escaped:
+            escaped = False
+            continue
+        if ch == "\\":
+            escaped = True
+            continue
+        if ch == "'" and not in_double:
+            in_single = not in_single
+        elif ch == '"' and not in_single:
+            in_double = not in_double
+        elif ch == "#" and not in_single and not in_double:
+            return line[:i].rstrip()
+    return line.rstrip()
+
+
+def _strip_if_elif(line: str) -> str | None:
+    """If line starts with if or elif, return the condition part, else None."""
+    s = line.strip()
+    if s.startswith("if "):
+        return s[3:].strip()
+    if s.startswith("elif "):
+        return s[5:].strip()
+    return None
+
+
+def _normalize_line_tokens(line: str) -> str:
+    """Normalize line by stripping comments and collapsing whitespace."""
+    no_comment = _strip_inline_comment(line)
+    return re.sub(r"\s+", " ", no_comment).strip()
+
+
+def _lines_match_tier2(orig_l: str, search_l: str, allow_if_elif: bool) -> bool:
+    o_raw = orig_l.rstrip("\r\n")
+    s_raw = search_l.rstrip("\r\n")
+    if o_raw == s_raw:
+        return True
+
+    o_norm = _normalize_line_tokens(o_raw)
+    s_norm = _normalize_line_tokens(s_raw)
+    if o_norm == s_norm:
+        return True
+
+    if allow_if_elif:
+        o_cond = _strip_if_elif(o_norm)
+        s_cond = _strip_if_elif(s_norm)
+        if o_cond is not None and s_cond is not None and o_cond == s_cond:
+            return True
+
+    return False
+
+
+def _tier2_find_unique_window(orig_lines: list[str], search_lines: list[str]) -> int | None:
+    """Find unique matching start index of search_lines in orig_lines, or None."""
+    if not orig_lines or not search_lines:
+        return None
+    M = len(search_lines)
+    candidate_indices: list[int] = []
+    for i in range(len(orig_lines) - M + 1):
+        window = orig_lines[i : i + M]
+        match = True
+        if_elif_used = 0
+        for o_l, s_l in zip(window, search_lines, strict=False):
+            if _lines_match_tier2(o_l, s_l, allow_if_elif=False):
+                continue
+            if M > 1 and if_elif_used == 0 and _lines_match_tier2(o_l, s_l, allow_if_elif=True):
+                if_elif_used += 1
+                continue
+            match = False
+            break
+        if match:
+            candidate_indices.append(i)
+    if len(candidate_indices) == 1:
+        return candidate_indices[0]
+    return None
+
+
+def _tier2_has_unique_match(content: str, search_text: str) -> bool:
+    """Check if search_text uniquely anchors to content under Tier 2 normalization."""
+    if not content.strip() or not search_text.strip():
+        return False
+    orig_lines = content.splitlines(keepends=True)
+    search_lines = search_text.splitlines(keepends=True)
+    return _tier2_find_unique_window(orig_lines, search_lines) is not None
+
+
+def _tier2_fallback_replace(
+    orig_text: str,
+    search_block: str,
+    replace_block: str,
+) -> str | None:
+    """Tier 2 fallback matcher: resilient to whitespace, inline comments, and if/elif drift."""
+    if not orig_text.strip() or not search_block.strip():
+        return None
+
+    newline = "\r\n" if "\r\n" in orig_text else "\n"
+    orig_lines = orig_text.splitlines(keepends=True)
+    search_lines = search_block.splitlines(keepends=True)
+    replace_lines = replace_block.splitlines(keepends=True)
+
+    idx = _tier2_find_unique_window(orig_lines, search_lines)
+    if idx is None:
+        return None
+
+    M = len(search_lines)
+    matched_window = orig_lines[idx : idx + M]
+
+    orig_first = ""
+    for line in matched_window:
+        if line.strip():
+            orig_first = line
+            break
+
+    search_first = ""
+    for line in search_lines:
+        if line.strip():
+            search_first = line
+            break
+
+    orig_indent = len(orig_first) - len(orig_first.lstrip())
+    search_indent = len(search_first) - len(search_first.lstrip())
+    indent_delta = orig_indent - search_indent
+
+    adjusted_replace: list[str] = []
+    for r_line in replace_lines:
+        r_raw = r_line.rstrip("\r\n")
+        if not r_raw.strip():
+            adjusted_replace.append(newline)
+            continue
+
+        if indent_delta > 0:
+            adj = (" " * indent_delta) + r_raw
+        elif indent_delta < 0:
+            dedent = min(-indent_delta, len(r_raw) - len(r_raw.lstrip()))
+            adj = r_raw[dedent:]
+        else:
+            adj = r_raw
+
+        adjusted_replace.append(adj + newline)
+
+    # If the original matched window had no trailing newline on its last line
+    if idx + M == len(orig_lines) and orig_lines and not orig_lines[-1].endswith(("\r", "\n")):
+        if adjusted_replace:
+            adjusted_replace[-1] = adjusted_replace[-1].rstrip("\r\n")
+
+    new_lines = orig_lines[:idx] + adjusted_replace + orig_lines[idx + M :]
+    return "".join(new_lines)
+
+
 def _content_contains_block(content: str, search_text: str) -> bool:
     if search_text in content:
         return True
@@ -141,8 +295,13 @@ def _find_target_file(
                 return f
         return cleaned
 
-    # Search for files containing search_text
+    # Search for files containing search_text (Tier 1 exact, then Tier 2 resilient)
     matches = [f for f, content in files.items() if _content_contains_block(content, search_text)]
+    if not matches:
+        matches = [
+            f for f, content in files.items() if _tier2_has_unique_match(content, search_text)
+        ]
+
     if len(matches) == 1:
         return matches[0]
 
@@ -209,6 +368,14 @@ def normalize_search_replace(
                 )
                 changed_files.add(target)
                 continue
+
+            # Tier 2 fallback resilient match
+            tier2_res = _tier2_fallback_replace(orig_content, search_block, replace_block)
+            if tier2_res is not None:
+                working_files[target] = tier2_res
+                changed_files.add(target)
+                continue
+
             raise ValueError(f"Search block not found in {target}: {search_block[:50]!r}")
 
         working_files[target] = orig_content.replace(search_block, replace_block, 1)

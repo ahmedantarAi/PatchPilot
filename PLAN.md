@@ -84,3 +84,15 @@ uv run --frozen pytest tests/test_distillation.py -q
 Expected: `export-train` writes `seeded_train` (360 cases) as ChatML JSONL (`sha256=610354bbc9db4e98963e652af58bb409453d9e2d4bc8119f94d1636b9470baea`, `train/eval overlap=0`) for the standalone Colab QLoRA notebook (`notebooks/train_qlora_colab.ipynb`, which exports a quantized `q4_k_m` GGUF + `Modelfile` registered in local Ollama via `ollama create` so both baseline and candidate run through `OllamaProvider` with no training deps in `pyproject.toml`). `compare` prints header lines `frozen split: OK (sha256=<64 hex>)` and `train/eval overlap: 0`, followed by a metrics table
 for both runs with `n_runs>=3` each. Training data comes only from `seeded_train`. Results may be quoted in the
 README only with the run ids printed here. Actual output: `exported 360 seeded_train samples to data/distillation_train.jsonl sha256=610354bbc9db4e98963e652af58bb409453d9e2d4bc8119f94d1636b9470baea (train/eval overlap=0)` and `5 passed in 13.40s` (verified 2026-11-07).
+
+## Phase 3b Refinement — Multi-File Real-World Pipeline Hardening
+Refines the LangGraph repair pipeline (`nodes.py`, `normalization.py`) for multi-file real-world repositories:
+1. **Traceback Fault Localization:** Extracts source files referenced in the failing test traceback, capping prompt context to the top 1-3 relevant source files in multi-file repos (>2 modifiable files or >15,000 chars). Measured max per-call prompt tokens are in D-44 (5,976 to 23,027; the earlier <4,000 target was not met).
+2. **Two-Tier Resilient SEARCH/REPLACE Matcher:** Tier 1 exact string match; Tier 2 unique-anchor fallback tolerant of trailing inline comments (`# ...`), whitespace/indentation drift, and minor `if`/`elif` header variance.
+3. **Granular Test-Failure Traceback in Retries:** Extracts targeted assertion and error frames from sandbox pytest output for actionable attempt 2 and 3 reflection.
+```powershell
+uv run --frozen pytest tests/test_normalization.py -q
+uv run --frozen python -m patchpilot.evals verify-frozen
+.\tasks.ps1 check
+```
+Expected: all unit tests for two-tier normalization and traceback localization pass; existing test suite (125+ tests) passes with zero regressions.

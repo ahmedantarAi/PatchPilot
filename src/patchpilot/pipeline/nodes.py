@@ -6,6 +6,7 @@ import ast
 import hashlib
 import json
 import logging
+import re
 import subprocess
 import sys
 import tempfile
@@ -191,6 +192,156 @@ def run_ruff_check(files: dict[str, str]) -> list[Finding]:
     return findings
 
 
+def extract_traceback_source_files(
+    failing_test_output: str,
+    files: dict[str, str],
+    max_files: int = 3,
+) -> list[str]:
+    """Parse failing test traceback to identify target source files referenced in stack frames."""
+    if not failing_test_output.strip() or not files:
+        return []
+
+    modifiable_map: dict[str, str] = {
+        p.replace("\\", "/"): p for p in files if is_modifiable_py_file(p)
+    }
+    if not modifiable_map:
+        return []
+
+    py_path_pattern = re.compile(
+        r'(?:File\s+["\']([^"\']+\.py)["\']|'
+        r"(?:^|[ \t])([a-zA-Z0-9_./\\-]+\.py)(?::\d+:|\s+line\s+\d+))",
+        re.MULTILINE,
+    )
+
+    seen_order: list[str] = []
+    frequency: dict[str, int] = {}
+
+    for line in failing_test_output.splitlines():
+        matches = py_path_pattern.findall(line)
+        for m1, m2 in matches:
+            raw_path = m1 or m2
+            if not raw_path:
+                continue
+            cleaned = raw_path.replace("\\", "/").strip()
+            matched_key: str | None = None
+            if cleaned in modifiable_map:
+                matched_key = modifiable_map[cleaned]
+            else:
+                for norm_path, orig_key in modifiable_map.items():
+                    if (
+                        cleaned.endswith("/" + norm_path)
+                        or norm_path.endswith("/" + cleaned)
+                        or cleaned == norm_path
+                    ):
+                        matched_key = orig_key
+                        break
+
+            if matched_key:
+                frequency[matched_key] = frequency.get(matched_key, 0) + 1
+                if matched_key not in seen_order:
+                    seen_order.append(matched_key)
+
+    if not seen_order:
+        return []
+
+    sorted_candidates = sorted(seen_order, key=lambda k: -frequency[k])
+    return sorted_candidates[:max_files]
+
+
+def _select_priority_files(
+    files: dict[str, str],
+    failing_test_output: str,
+    findings: list[Finding] | None = None,
+    max_files: int = 3,
+    max_total_chars: int = 25000,
+) -> list[str]:
+    """Select the most relevant non-test .py files for prompt context."""
+    non_test_py_files = [p for p in sorted(files) if is_modifiable_py_file(p)]
+    if not non_test_py_files:
+        return []
+
+    total_chars = sum(len(files[p]) for p in non_test_py_files)
+    if len(non_test_py_files) <= 2 and total_chars <= 15000:
+        return non_test_py_files
+
+    tb_files = extract_traceback_source_files(failing_test_output, files, max_files=max_files)
+    finding_files: list[str] = []
+    if findings:
+        for f in findings:
+            if is_modifiable_py_file(f.file) and f.file in files and f.file not in finding_files:
+                finding_files.append(f.file)
+
+    selected: list[str] = []
+    for path in tb_files + finding_files:
+        if path not in selected:
+            selected.append(path)
+
+    if not selected:
+        selected = non_test_py_files[:max_files]
+
+    selected = selected[:max_files]
+
+    bounded: list[str] = []
+    accum_chars = 0
+    for p in selected:
+        content_len = len(files[p])
+        if bounded and (accum_chars + content_len > max_total_chars):
+            break
+        bounded.append(p)
+        accum_chars += content_len
+
+    return bounded or selected[:1]
+
+
+def extract_concise_pytest_failure(
+    stdout: str,
+    stderr: str,
+    max_lines: int = 50,
+) -> str:
+    """Extract targeted failure details (FAILURES/ERRORS or short summary) from pytest output."""
+    combined = (stdout + "\n" + stderr).strip()
+    if not combined:
+        return ""
+
+    lines = combined.splitlines()
+
+    failures_start = -1
+    errors_start = -1
+    summary_start = -1
+
+    for idx, line in enumerate(lines):
+        clean = line.strip()
+        if clean.startswith("===") and "FAILURES" in clean:
+            failures_start = idx
+        elif clean.startswith("===") and "ERRORS" in clean:
+            errors_start = idx
+        elif clean.startswith("===") and "short test summary info" in clean:
+            summary_start = idx
+
+    start_idx = failures_start if failures_start != -1 else errors_start
+    if start_idx != -1:
+        extracted = lines[start_idx : start_idx + max_lines]
+        if summary_start != -1 and summary_start >= start_idx + max_lines:
+            summary_lines = lines[summary_start : min(len(lines), summary_start + 15)]
+            return "\n".join(extracted) + "\n...\n" + "\n".join(summary_lines)
+        return "\n".join(extracted)
+
+    if summary_start != -1:
+        summary_lines = lines[summary_start : min(len(lines), summary_start + max_lines)]
+        return "\n".join(summary_lines)
+
+    tb_indices = [i for i, line in enumerate(lines) if "Traceback (most recent call last):" in line]
+    if tb_indices:
+        last_tb = tb_indices[-1]
+        tb_lines = lines[last_tb : min(len(lines), last_tb + max_lines)]
+        return "\n".join(tb_lines)
+
+    if len(lines) <= max_lines:
+        return combined
+
+    return "\n".join(lines[-max_lines:])
+
+
 async def run_llm_diff_analysis(
     files: dict[str, str],
     provider: LLMProvider,
@@ -227,8 +378,9 @@ async def run_llm_diff_analysis(
         for ctx in retrieved_context:
             prompt_lines.append(ctx)
 
+    priority_files = _select_priority_files(files, failing_test_output, findings=findings)
     prompt_lines.append("Repository non-test .py file contents:")
-    for path in non_test_py_files:
+    for path in priority_files:
         prompt_lines.append(f"--- File: {path} ---")
         prompt_lines.append(files[path])
 
@@ -455,10 +607,18 @@ def create_propose_node(
             prompt_parts.append(state.feedback)
             prompt_parts.append("Please analyze the failure and adjust your fix accordingly.")
 
+        priority_source_files = _select_priority_files(
+            state.files,
+            state.failing_test_output,
+            findings=state.findings,
+        )
+        test_files = [p for p in sorted(state.files) if is_test_file(p)]
+        files_to_include = test_files + [p for p in priority_source_files if p not in test_files]
+
         prompt_parts.append("Repository files:")
-        for path, content in sorted(state.files.items()):
+        for path in files_to_include:
             prompt_parts.append(f"--- File: {path} ---")
-            prompt_parts.append(content)
+            prompt_parts.append(state.files[path])
 
         req = LLMRequest(
             messages=[Message(role="user", content="\n".join(prompt_parts))],
@@ -634,14 +794,16 @@ def create_verify_node(
 
         feedback = ""
         if not verified:
+            concise_failure = extract_concise_pytest_failure(result.stdout, result.stderr)
             feedback = (
                 f"Attempt {attempt} verification failed:\n"
                 f"Patch applied: {patch_applies}\n"
                 f"Exit code: {result.exit_code}\n"
-                f"STDOUT:\n{result.stdout}\n"
-                f"STDERR:\n{result.stderr}\n"
-                f"Error: {result.error}"
             )
+            if concise_failure:
+                feedback += f"Failure details:\n{concise_failure}\n"
+            elif result.error:
+                feedback += f"Error: {result.error}\n"
 
         if tracer is not None and span_id is not None:
             tracer.end_node_span(

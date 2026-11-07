@@ -61,11 +61,11 @@ uv run --frozen python -m patchpilot trace-smoke
 Expected: first run `trace_id=<32 hex> visible=true` (provisioned non-interactively via `LANGFUSE_INIT_*` env vars); after `obs-down`, second run
 `tracing disabled: no-op` with exit 0 (core flow works without Langfuse).
 
-## Phase 6 — Model router (Ollama / Gemini / Mock)
+## Phase 6 — Model router (Ollama / Frontier (Gemini / OpenRouter) / Mock)
 ```powershell
 uv run --frozen pytest tests/test_router.py -q
 ```
-Expected: `9 passed` — covers task-difficulty routing (`StaticRulePolicy` weak-spot heuristics for `none_handling` / `sql_injection` and AST complexity thresholds, plus `CascadeConfidencePolicy` retry escalation), Gemini quota exhaustion (HTTP 429) → Ollama fallback with trace warning flag, network timeout fallback, private-data requests (`data_class="private"`) forced to local Ollama (`SPEC §9`), end-to-end pipeline + cost/latency telemetry integration, and a 10-case `seeded_train` smoke benchmark (`69.81%` cost savings vs. 100% Gemini, `10/10` `pass@1`). Actual output: `9 passed in 7.01s` (verified 2026-11-06).
+Expected: `9 passed` — covers task-difficulty routing (`StaticRulePolicy` weak-spot heuristics for `none_handling` / `sql_injection` and AST complexity thresholds, plus `CascadeConfidencePolicy` retry escalation), Frontier (Gemini / OpenRouter) quota exhaustion (HTTP 429) → Ollama fallback with trace warning flag, network timeout fallback, private-data requests (`data_class="private"`) forced to local Ollama (`SPEC §9`), end-to-end pipeline + cost/latency telemetry integration, and a 10-case `seeded_train` smoke benchmark (`69.81%` cost savings vs. 100% Frontier (Gemini / OpenRouter), `10/10` `pass@1`). Actual output: `9 passed in 7.01s` (verified 2026-11-06).
 
 ## Phase 7 — GitHub PR integration
 ```powershell

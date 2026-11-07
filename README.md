@@ -15,10 +15,11 @@ An autonomous, self-healing code review and patch verification agent engineered 
 ## Key Highlights
 
 - **Cyclic LangGraph Repair Pipeline (`analyze → propose ⇄ verify → report`):** Combines Python `ast.parse`, isolated `ruff check --isolated --no-config`, per-case Qdrant vector retrieval, and a bounded retry loop ($k = 3$) that feeds pytest tracebacks back into patch generation while blocking test-file modifications (anti-reward-hacking guard).
-- **Dynamic AST Model Router (`ModelRouter`):** Zero-overhead static feature extraction routes routine bugs to local GPU inference (`qwen2.5-coder:7b` via native Windows Ollama at `$0.00` marginal cost) and escalates complex ASTs, known local blind spots (`none_handling`, `sql_injection`), and retry attempts to frontier cloud models (`GeminiProvider` or `OpenRouterProvider` with `google/gemma-4-31b-it:free`). On a 10-case `seeded_train` smoke benchmark (`DECISIONS.md` D-39), routing cut estimated Gemini Flash API cost by **69.81%** and reduced simulated latency by **49.4%** vs. all-frontier while achieving **10/10 (100.0%)** `pass@1`.
+- **Dynamic AST Model Router (`ModelRouter`):** Zero-overhead static feature extraction routes routine bugs to local GPU inference (`qwen2.5-coder:7b` via native Windows Ollama at `$0.00` marginal cost) and escalates complex ASTs, known local blind spots (`none_handling`, `sql_injection`), and retry attempts to frontier cloud models (`GeminiProvider` or `OpenRouterProvider` with `google/gemma-4-31b-it:free`). On a 10-case `seeded_train` smoke benchmark (`DECISIONS.md` D-39), routing achieved **10/10 (100.0%)** `pass@1` with **69.81%** cost savings and **49.4%** simulated latency reduction vs. all-frontier. These numbers were simulated using commercial Gemini Flash list prices as a reference baseline (real billing for Gemini free tier and OpenRouter Gemma free tier is `$0.00`); the default frontier provider is OpenRouter (`google/gemma-4-31b-it:free`), but the router benchmark was built against Gemini (commit `c3a95a9`) and has not been measured on Gemma.
 - **Fail-Closed Privacy Gate (`SPEC §9`, D-14, D-20):** Every `LLMRequest` defaults to `data_class="private"`. Non-public requests are strictly forced to local host Ollama; any direct non-public call to `GeminiProvider` or `OpenRouterProvider` raises `PrivacyViolationError` (`ProviderError`) before any network request is made.
 - **Hardened Docker Verification Sandbox (`SPEC §6`, D-29, D-31):** Ephemeral `docker run --rm` containers enforce `--network none`, `--read-only`, `--user 10001:10001`, `--cap-drop ALL`, `--security-opt no-new-privileges`, `--pids-limit 256`, `--memory 768m`, tmpfs-only `/work` and `/tmp`, a fail-fast cross-process single-run lock (`SandboxBusyError`), and **8/8 hostile fixture containment** (`python -m patchpilot.sandbox selftest`).
-- **Cryptographically Frozen Evaluation Suite (`evals/FROZEN.json`):** 480 seeded cases across 56 distinct templates (14 eval-only / 42 train-only; `eval_templates ∩ train_templates == ∅`), 20 curated real-world bug fixes, 50 labelled review findings, and 8 safety fixtures. Achieved **105 / 120 (87.5%)** `pass@1` and `pass@3` (`95% Wilson CI: [80.4%, 92.3%]`) across 3 runs on the frozen `seeded_eval` split (run ID `seeded_eval_ollama_s1_0589c278`, git tag `baseline-seeded-eval-v1`).
+- **Cryptographically Frozen Evaluation Suite (`evals/FROZEN.json`):** 480 seeded synthetic cases across 56 distinct templates (14 eval-only / 42 train-only; `eval_templates ∩ train_templates == ∅`) and 8 hostile safety fixtures (verified via `python -m patchpilot.sandbox selftest`). Achieved **105 / 120 (87.5%)** `pass@1` and `pass@3` (`95% Wilson CI: [80.4%, 92.3%]`) evaluated across 120 cases × 3 identical runs (temperature 0; effective $n = 120$) on the frozen `seeded_eval` split (run ID `seeded_eval_ollama_s1_0589c278`, git tag `baseline-seeded-eval-v1`).
+- **Real-World Generalization Benchmark (`evals/FROZEN_REALWORLD_MINI.json`):** 14 single-file bug fixes across 9 open-source repositories (`realworld_mini`, git tag `eval-realworld-mini-v1`, `DECISIONS.md` D-43). Baseline evaluation on local Ollama (`qwen2.5-coder:7b`) yielded **0 / 14 (0.0%)** `pass@1` and `pass@3` (`95% Wilson CI: [0.0%, 21.5%]`, small sample), consistent with a synthetic-to-real gap.
 - **Automated GitHub PR Review CLI (`patchpilot review`):** Inspects local repositories or live GitHub Pull Requests via plain `httpx` REST calls, emitting GitHub ` ```suggestion ` blocks for sandbox-verified fixes and descriptive risk notes for unverified findings, with strict `GITHUB_TOKEN` redaction.
 - **Trace Distillation & QLoRA Colab Pipeline (D-41):** Exports 360 zero-leakage `seeded_train` trajectories in ChatML format (`sha256=610354bbc9db4e98963e652af58bb409453d9e2d4bc8119f94d1636b9470baea`) for a standalone Google Colab T4 4-bit QLoRA notebook (`notebooks/train_qlora_colab.ipynb`) that produces a quantized `q4_k_m` GGUF and Ollama `Modelfile` without adding heavy ML dependencies to `pyproject.toml`.
 
@@ -74,12 +75,12 @@ All accuracy, cost, and runtime figures reported below are produced by recorded 
 
 Evaluated across the cryptographically frozen `seeded_eval` split (`evals/FROZEN.json`, SHA-256 `d39534c5de1f39017efaafdaab0178fe98ba4a2c3ad1b5643500ec78d65d6c31`) containing **$N = 120$ distinct cases** across **14 eval-only structural templates** (2 reserved templates per bug class across 7 classes; zero template or hash overlap with `seeded_train`). Executed for $n_{\text{runs}} = 3$ complete passes at `seed=1` with `prompt_version_hash=ca774b4a6efb4c2384a6f216439068326840bd10ec0543a1032f135bc0f20782`:
 
-| Pool | Model (`LLMProvider`) | Distinct Cases ($N$) | Runs ($n$) | `pass@1` (per run) | `pass@3` (per run) | 95% Wilson CI ($N=120$) | Recorded Run ID & Artifacts |
+| Pool | Model (`LLMProvider`) | Distinct Cases ($N$) | Runs ($n$) | `pass@1` (per run) | `pass@3` (per run) | 95% Wilson CI (effective $n=120$) | Recorded Run ID & Artifacts |
 |---|---|---|---|---|---|---|---|
-| `seeded_eval` (14 templates, 7 classes) | `qwen2.5-coder:7b` (`ollama`) | 120 | 3 (identical per-case outcomes across all 3 runs) | **105 / 120 (87.5%)** | **105 / 120 (87.5%)** | **[80.4%, 92.3%]** | `seeded_eval_ollama_s1_0589c278` (`evals/results/seeded_eval_ollama_s1_0589c278_run{1,2,3}.json`, tag `baseline-seeded-eval-v1`) |
+| `seeded_eval` (14 templates, 7 classes) | `qwen2.5-coder:7b` (`ollama`) | 120 cases × 3 identical runs (temperature 0; effective $n=120$) | 3 | **105 / 120 (87.5%)** | **105 / 120 (87.5%)** | **[80.4%, 92.3%]** | `seeded_eval_ollama_s1_0589c278` (`evals/results/seeded_eval_ollama_s1_0589c278_run{1,2,3}.json`, tag `baseline-seeded-eval-v1`) |
 
 > [!NOTE]
-> **Statistical Scope:** Each of the 3 runs (`run1`: 2002.1 s, `run2`: 2092.5 s, `run3`: 1927.0 s) produced the exact same 105/120 verified fixes (315/360 total executions). Because repeated runs evaluate the same 120 cases rather than 360 independent cases, confidence intervals are reported at the true sample size $N = 120$ per run (`[80.4%, 92.3%]`), and generalization is bounded by the 14 reserved eval templates.
+> **Statistical Scope:** Evaluated across 120 cases × 3 identical runs (temperature 0; effective $n = 120$). Each of the 3 runs (`run1`: 2002.1 s, `run2`: 2092.5 s, `run3`: 1927.0 s) produced the exact same 105/120 verified fixes (315/360 total executions). Because repeated runs at temperature 0 evaluate the same 120 cases rather than 360 independent cases, confidence intervals are reported at the true effective sample size $n = 120$ per run (`[80.4%, 92.3%]`), and generalization is bounded by the 14 reserved eval templates.
 
 #### Per-Class Taxonomy Breakdown (`seeded_eval_ollama_s1_0589c278`, per run $N = 120$)
 
@@ -100,12 +101,12 @@ Evaluated across the cryptographically frozen `seeded_eval` split (`evals/FROZEN
 
 `ModelRouter` (`src/patchpilot/router/`) extracts static AST and prompt signals (`ast_node_count`, `max_ast_depth`, `non_test_file_count`, `estimated_prompt_tokens`, retry state, and taxonomy weak-spot patterns) before every LLM call. Routine requests stay on local Ollama (`$0.00` marginal API cost); tasks matching local weak spots (`none_handling`, `sql_injection`), high AST complexity (`ast_node_count >= 80`, `max_ast_depth >= 10`, `non_test_file_count >= 3`, or `estimated_prompt_tokens >= 1200`), or cascade retry (`is_retry == True` on attempt $\ge 2$) escalate to the configured frontier provider (`PP_FRONTIER_PROVIDER=openrouter|gemini`).
 
-On the deterministic **10-case `seeded_train` smoke benchmark** (`seeded_train/0001..0010`, verified in `tests/test_router.py::test_router_smoke_benchmark_10_seeded_train_cases`, `DECISIONS.md` D-39, priced using Gemini Flash reference rates of `$0.10 / 1M` prompt tokens and `$0.40 / 1M` completion tokens with simulated provider latencies):
+On the deterministic **10-case `seeded_train` smoke benchmark** (`seeded_train/0001..0010`, verified in `tests/test_router.py::test_router_smoke_benchmark_10_seeded_train_cases`, `DECISIONS.md` D-39). The 69.81% cost savings and 49.4% latency reduction were simulated using commercial Gemini Flash list prices (`$0.10 / 1M` prompt tokens, `$0.40 / 1M` completion tokens) as a reference baseline; real billing for both the Gemini free tier and OpenRouter Gemma free tier is `$0.00`. The default frontier provider is OpenRouter (`google/gemma-4-31b-it:free`), but this smoke benchmark was built against Gemini (commit `c3a95a9`) and has not been measured on Gemma:
 
 | Routing Strategy | `pass@1` ($n=10$) | Local Calls (Ollama 7B) | Frontier Calls | Estimated API Cost | Simulated Latency | Cost Savings vs. All-Frontier |
 |---|---|---|---|---|---|---|
 | **All-Local (`OllamaProvider`)** | 7 / 10 (70.0%) | 100% | 0% | `$0.0000000` | `6.5s` | — |
-| **All-Frontier (Gemini Flash pricing)** | 10 / 10 (100.0%) | 0% | 100% (20/20) | `$0.0014792` | `17.0s` | Baseline (`0.0%`) |
+| **All-Frontier (simulated Gemini Flash list pricing)** | 10 / 10 (100.0%) | 0% | 100% (20/20) | `$0.0014792` | `17.0s` | Baseline (`0.0%`) |
 | **`ModelRouter` (`CascadeConfidencePolicy`)** | **10 / 10 (100.0%)** | **14 / 20 (70.0%)** | **6 / 20 (30.0%)** | **`$0.0004466`** | **`8.6s`** | **69.81% savings** (`49.4%` lower simulated latency) |
 
 - **Resiliency & Auto-Fallback:** When the frontier API raises `ProviderError` (such as HTTP 429 rate-limit exhaustion or network timeout), `ModelRouter` catches the failure, falls back to local Ollama without aborting the pipeline, sets `fallback_used = True`, and attaches `warning_flag="frontier_fallback:rate_limit_429:..."` or `"frontier_fallback:network_timeout:..."` to the Langfuse OTLP generation span at `WARNING` level.
@@ -123,6 +124,56 @@ In compliance with `AGENTS.md` Rule 12, all prompt engineering was conducted exc
 | Round 1 (strict `SEARCH:` delimiters, no 3rd-party imports) | 17 | `1f0b17fa0d4c` | 43 / 60 (71.7%) | 44 / 60 (73.3%) | `[59.2%, 81.5%]` | `seeded_train_ollama_s17_e1a7e2f0` |
 | Round 2 (no outer code fences, `?` SQL tuples, `dict.get` note) | 29 | `a16d55560e35` | 49 / 60 (81.7%) | 49 / 60 (81.7%) | `[70.1%, 89.4%]` | `seeded_train_ollama_s29_62fd0d31` |
 | **Round 3 (`prompts-v1`, full-file `SEARCH/REPLACE` guidance)** | **43** | **`ca774b4a6efb`** | **49 / 60 (81.7%)** | **49 / 60 (81.7%)** | **`[70.1%, 89.4%]`** | **`seeded_train_ollama_s43_e3d54b4e`** |
+
+---
+
+### 4. Real-World Evaluation Check (`realworld_mini`) & Limitations
+
+To test generalization beyond synthetic templates, we curated `realworld_mini`, a frozen benchmark pool of **14 single-file bug fixes across 9 pure-Python open-source repositories** (SHA-256 frozen in `evals/FROZEN_REALWORLD_MINI.json`, git tag `eval-realworld-mini-v1`, `DECISIONS.md` D-43).
+
+| Benchmark Pool | Provider & Model | Distinct Cases ($N$) | `pass@1` | `pass@3` | 95% Wilson CI | Recorded Run ID & Status |
+|---|---|:---:|:---:|:---:|:---:|---|
+| **`realworld_mini` (Baseline)** | `qwen2.5-coder:7b` (`ollama`) | 14 | **0 / 14 (0.0%)** | **0 / 14 (0.0%)** | **`[0.0%, 21.5%]`** | `realworld_mini_ollama_s1_e267146f` (tag `eval-realworld-mini-v1`, D-43) |
+| **`realworld_mini` (Experimental Branch)** | `qwen2.5-coder:7b` (`ollama`) | 14 | 1 / 14 (7.1%) | 1 / 14 (7.1%) | `[1.3%, 31.5%]` | Branch `experimental/realworld-pipeline-refinements` (commit `f4cb255`, D-44) |
+
+> [!IMPORTANT]
+> **Limitations & Empirical Findings:**
+> 1. **Synthetic-to-Real Domain Gap:** The drop from **87.5% (105/120)** on synthetic templates to **0.0% (0/14)** on real-world repositories is the primary empirical finding of this work. While local 7B models succeed on small synthetic single-function templates (< 50 lines), failure analysis on `realworld_mini` (D-43) indicates that brittle exact `SEARCH` string matching (5 cases), incorrect bug logic or test failures in the sandbox (7 cases), formatting/normalization issues (1 case), and test-file edit rejection by the reward-hacking guard (1 case) collectively hinder zero-shot repair on real-world codebases, rather than any single unverified factor.
+> 2. **Post-Hoc Experimental Branch:** The experimental branch `experimental/realworld-pipeline-refinements` (commit `f4cb255`, D-44) introduces a Tier-2 resilient matcher and stack-trace file filtering that passed 1 case after post-hoc tuning (0005, `jsonpointer`, `pass@1 = True`). However, these heuristics were developed and tuned post-hoc after inspecting the baseline failure modes on `realworld_mini`; this is **not a held-out evaluation result** and a 1/14 vs 0/14 difference is not statistically distinguishable (confidence intervals overlap fully).
+> 3. **Simulated Router Savings:** The cost savings (69.81%) and simulated latency reductions (49.4%) reported for `ModelRouter` were evaluated on a 10-case smoke benchmark of synthetic fixtures (`DECISIONS.md` D-39) using commercial Gemini Flash list prices as a reference baseline; real billing for both the Gemini free tier and OpenRouter Gemma free tier is `$0.00`. The default frontier provider is OpenRouter (`google/gemma-4-31b-it:free`), but the router benchmark was built against Gemini (commit `c3a95a9`) and has not been measured on Gemma; these numbers do not reflect live production traffic or live API billing calls.
+> 4. **Prompt Tuning Reflects Format Compliance:** The progression from 58.3% to 81.7% on `seeded_train` reflects prompt compliance (strict `SEARCH/REPLACE` delimiters without markdown backticks) rather than improved underlying algorithmic reasoning.
+> 5. **Mocked PR Review & Un-trained QLoRA:** GitHub PR integration (`patchpilot review`) has been tested against offline fixtures and mock providers only; live PR posting has not been executed on production repositories. The QLoRA distillation pipeline (`data/distillation_train.jsonl`, `notebooks/train_qlora_colab.ipynb`) is fully implemented with verified zero eval leakage, but no fine-tuned model has been trained or evaluated yet.
+> 6. **Training-Data Contamination Risk:** The 9 open-source repositories are popular public projects; their source code and test suites may have been present in pre-training data for `qwen2.5-coder:7b`.
+
+---
+
+### 5. Rebuilding & Attributions for `realworld_mini`
+
+The raw repository files in `evals/datasets/realworld_mini` are gitignored to avoid vendoring third-party source trees. The pool can be deterministically reproduced on the host and verified against the cryptographic manifest:
+
+```powershell
+# 1. Fetch parent commits on host and verify test failure/pass transitions in Docker
+uv run --frozen python -m patchpilot.evals build-realworld-mini
+
+# 2. Verify dataset integrity against the cryptographic freeze manifest
+uv run --frozen python -m patchpilot.evals verify-frozen-realworld-mini
+```
+
+#### Upstream Repository Attributions
+
+The 14 cases in `realworld_mini` are derived from the following permissively licensed open-source projects:
+
+| Project | Cases | License | Upstream Repository |
+|---|:---:|---|---|
+| **dacite** | 2 | MIT | [konradhalas/dacite](https://github.com/konradhalas/dacite) |
+| **schema** | 1 | MIT | [keleshev/schema](https://github.com/keleshev/schema) |
+| **jsonpointer** | 2 | BSD-3-Clause | [stefankoegl/python-json-pointer](https://github.com/stefankoegl/python-json-pointer) |
+| **parse** | 2 | MIT | [r1chardj0n3s/parse](https://github.com/r1chardj0n3s/parse) |
+| **docopt-ng** | 2 | MIT | [jazzband/docopt-ng](https://github.com/jazzband/docopt-ng) |
+| **python-semver** | 2 | BSD-3-Clause | [python-semver/python-semver](https://github.com/python-semver/python-semver) |
+| **tabulate** | 1 | MIT | [astanin/python-tabulate](https://github.com/astanin/python-tabulate) |
+| **mistune** | 1 | BSD-3-Clause | [lepture/mistune](https://github.com/lepture/mistune) |
+| **tinydb** | 1 | MIT | [msiemens/tinydb](https://github.com/msiemens/tinydb) |
 
 ---
 
@@ -200,12 +251,13 @@ PP_FRONTIER_PROVIDER=openrouter
 PP_OLLAMA_BASE_URL=http://localhost:11434
 PP_OLLAMA_MODEL=qwen2.5-coder:7b
 
-# OpenRouter free-tier frontier model (PUBLIC/SYNTHETIC CODE ONLY — SPEC §9)
-PP_OPENROUTER_API_KEY=sk-or-v1-...
+# OpenRouter free-tier frontier model (PUBLIC/SYNTHETIC CODE ONLY — SPEC §9; default frontier in config.py)
+PP_OPENROUTER_API_KEY=
 PP_OPENROUTER_MODEL=google/gemma-4-31b-it:free
 PP_OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
 
 # Google Gemini free-tier frontier model (PUBLIC/SYNTHETIC CODE ONLY — SPEC §9)
+# Model name matches .env.example (gemini-3.6-flash; earlier planning notes cited gemini-3.8-flash)
 PP_GEMINI_API_KEY=
 PP_GEMINI_MODEL=gemini-3.6-flash
 ```
@@ -337,6 +389,7 @@ PatchPilot/
 ├── data/                       # Exported ChatML distillation datasets (gitignored)
 ├── evals/                      # Evaluation benchmark suite & frozen split manifest
 │   ├── FROZEN.json             # Cryptographic SHA-256 freeze manifest for seeded_eval & safety
+│   ├── FROZEN_REALWORLD_MINI.json # Cryptographic freeze manifest for realworld_mini pool
 │   ├── datasets/               # Materialized case pools (gitignored; built via `evals build --seed 1337`)
 │   └── results/                # Committed baseline JSON reports (`seeded_eval_ollama_s1_0589c278_run*.json`)
 ├── notebooks/
@@ -359,7 +412,7 @@ PatchPilot/
 │   └── tracing.py              # Langfuse v4 OTLP/HTTP tracer and dataset run synchronization
 ├── tests/                      # 125 offline unit/integration tests + 22 live/Docker containment tests
 ├── AGENTS.md                   # Mandatory engineering & evaluation integrity rules
-├── DECISIONS.md                # Architectural decision log (D-01 through D-42)
+├── DECISIONS.md                # Architectural decision log (D-01 through D-45)
 ├── PLAN.md                     # Phase 0–8 acceptance contracts and verification outputs
 ├── SPEC.md                     # System specification, threat model, and resource budget
 ├── docker-compose.yml          # Pinned Qdrant (core) and Langfuse v4 (`observability` profile) definitions

@@ -119,8 +119,8 @@ async def _run_command(case_arg: str, provider_name: str) -> int:
     return 0
 
 
-async def _trace_smoke_command() -> int:
-    _, msg = await run_trace_smoke()
+async def _trace_smoke_command(provider_name: str = "mock") -> int:
+    _, msg = await run_trace_smoke(provider_name=provider_name)
     print(msg)
     return 0
 
@@ -162,13 +162,19 @@ def main() -> None:
     run_parser.add_argument(
         "--provider",
         default="mock",
-        choices=["mock", "ollama", "gemini", "router"],
+        choices=["mock", "ollama", "gemini", "openrouter", "router"],
         help="LLM provider name (default: mock)",
     )
 
-    subparsers.add_parser(
+    trace_smoke_parser = subparsers.add_parser(
         "trace-smoke",
         help="Verify Langfuse trace ingestion/visibility or degrade to no-op when down",
+    )
+    trace_smoke_parser.add_argument(
+        "--provider",
+        default="mock",
+        choices=["mock", "ollama", "gemini", "openrouter", "router"],
+        help="LLM provider name (default: mock)",
     )
 
     review_parser = subparsers.add_parser(
@@ -199,7 +205,7 @@ def main() -> None:
     review_parser.add_argument(
         "--provider",
         default="router",
-        choices=["mock", "ollama", "gemini", "router"],
+        choices=["mock", "ollama", "gemini", "openrouter", "router"],
         help="LLM provider name (default: router)",
     )
     review_parser.add_argument(
@@ -214,7 +220,7 @@ def main() -> None:
         exit_code = asyncio.run(_run_command(args.case, args.provider))
         sys.exit(exit_code)
     elif args.subcommand == "trace-smoke":
-        exit_code = asyncio.run(_trace_smoke_command())
+        exit_code = asyncio.run(_trace_smoke_command(args.provider))
         sys.exit(exit_code)
     elif args.subcommand == "review":
         exit_code = asyncio.run(

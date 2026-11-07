@@ -580,6 +580,7 @@ async def run_trace_smoke(
     settings: LangfuseSettings | None = None,
     *,
     transport: httpx.AsyncBaseTransport | None = None,
+    provider_name: str = "mock",
 ) -> tuple[bool, str]:
     """Execute the Phase 5 `trace-smoke` check against Langfuse or return no-op when down."""
     cfg = settings or LangfuseSettings()
@@ -603,8 +604,8 @@ async def run_trace_smoke(
     span_id, perf_start, iso_start = tracer.start_node_span("analyze", {"smoke": True})
     tracer.record_llm_call(
         node="analyze",
-        model="mock-smoke",
-        provider="mock",
+        model=f"{provider_name}-smoke" if provider_name != "mock" else "mock-smoke",
+        provider=provider_name,
         prompt_tokens=12,
         completion_tokens=8,
         latency_s=0.01,

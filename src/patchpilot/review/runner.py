@@ -152,6 +152,7 @@ async def run_review(
     verify_fn: VerifyCallable | None = None,
     tracer: PatchPilotTracer | None = None,
     report_out: Path | None = None,
+    assume_public: bool = False,
 ) -> ReviewResult:
     """Execute PatchPilot PR review in local (`--repo-dir`) or remote (`--repo` + `--pr`) mode."""
     # Allow `--repo <local_path>` if `--repo-dir` was omitted and `--pr` is not provided
@@ -185,9 +186,8 @@ async def run_review(
         files = _load_local_repo_dir(local_path)
         known_mock_patch = _load_local_mock_patch(local_path)
         source_label = local_path.as_posix()
-        data_class = (
-            "public" if "fixtures" in source_label or "evals" in source_label else "private"
-        )
+        # Fail closed (SPEC §9, D-20): local dirs are private unless explicitly declared public.
+        data_class = "public" if assume_public else "private"
     else:
         assert repo is not None and pr_number is not None
         pr_ctx = await gh.fetch_pull_request(repo, pr_number)

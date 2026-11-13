@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass, field
 
 from patchpilot.pipeline.models import Finding
 from patchpilot.review.github import PostedReviewComment
@@ -10,65 +11,146 @@ from patchpilot.review.github import PostedReviewComment
 _HUNK_HEADER_RE = re.compile(r"^@@\s+-(\d+)(?:,(\d+))?\s+\+(\d+)(?:,(\d+))?\s+@@")
 
 
-def extract_diff_suggestion(patch_diff: str) -> tuple[str, int, str, str] | None:
-    """Extract `(target_file, changed_line, replacement_code, raw_hunk)` from a unified diff."""
-    if not patch_diff.strip():
-        return None
+@dataclass(frozen=True)
+class DiffSuggestion:
+    """One contiguous change group of a unified diff, mapped to head-file (`RIGHT`) lines.
 
-    target_file = ""
+    The verified patch is generated against the PR head content, so its `-`/context line
+    numbers are exactly the line numbers of the PR's new file (GitHub `side="RIGHT"`).
+    `start_line..end_line` is the inclusive range that `replacement_code` replaces.
+    """
+
+    file: str
+    start_line: int
+    end_line: int
+    replacement_code: str
+    raw_hunk: str
+
+
+@dataclass
+class _Hunk:
+    file: str
+    old_start: int
+    lines: list[str] = field(default_factory=list)
+
+
+def _parse_hunks(patch_diff: str) -> list[_Hunk]:
+    """Parse every hunk of every file in a unified diff (tolerant of inexact hunk counts)."""
+    hunks: list[_Hunk] = []
     lines = patch_diff.splitlines()
-    hunk_lines: list[str] = []
-    in_hunk = False
-    old_start = 1
+    target_file = ""
+    current: _Hunk | None = None
+    old_left = new_left = 0
 
-    for line in lines:
-        if line.startswith("+++ "):
-            raw_path = line[4:].strip()
+    for idx, line in enumerate(lines):
+        if line.startswith("diff --git "):
+            current = None
+            target_file = ""
+            continue
+        if (
+            line.startswith("--- ")
+            and idx + 2 < len(lines)
+            and lines[idx + 1].startswith("+++ ")
+            and lines[idx + 2].startswith("@@")
+        ):
+            current = None
+            continue
+        if (
+            line.startswith("+++ ")
+            and idx > 0
+            and lines[idx - 1].startswith("--- ")
+            and idx + 1 < len(lines)
+            and lines[idx + 1].startswith("@@")
+        ):
+            raw_path = line[4:].split("\t", 1)[0].strip()
             if raw_path.startswith("b/"):
                 raw_path = raw_path[2:]
-            target_file = raw_path
-            continue
-        if line.startswith("--- "):
+            if raw_path != "/dev/null":
+                target_file = raw_path
+            current = None
             continue
         match = _HUNK_HEADER_RE.match(line)
         if match:
-            if in_hunk and hunk_lines:
-                break
-            in_hunk = True
-            old_start = int(match.group(1))
-            hunk_lines.append(line)
+            old_left = int(match.group(2)) if match.group(2) is not None else 1
+            new_left = int(match.group(4)) if match.group(4) is not None else 1
+            current = _Hunk(file=target_file, old_start=int(match.group(1)), lines=[line])
+            hunks.append(current)
             continue
-        if in_hunk:
-            if line.startswith("diff --git "):
-                break
-            hunk_lines.append(line)
+        if current is None:
+            continue
+        current.lines.append(line)
+        if line.startswith("-"):
+            old_left -= 1
+        elif line.startswith("+"):
+            new_left -= 1
+        elif line.startswith("\\"):
+            pass
+        else:
+            old_left -= 1
+            new_left -= 1
+    return [h for h in hunks if h.file]
 
-    if not target_file or not hunk_lines:
-        return None
 
-    # Find the specific modified line range (+ / - lines inside the hunk)
-    cur_line = old_start
-    first_changed_line: int | None = None
-    added_lines: list[str] = []
+def _suggestions_for_hunk(hunk: _Hunk) -> list[DiffSuggestion]:
+    raw_hunk = "\n".join(hunk.lines)
+    out: list[DiffSuggestion] = []
+    old_no = hunk.old_start
+    prev_ctx: tuple[int, str] | None = None
+    removed: list[int] = []
+    added: list[str] = []
 
-    for hline in hunk_lines[1:]:
+    def flush(next_ctx: tuple[int, str] | None) -> None:
+        nonlocal removed, added
+        if removed:
+            start, end, repl = removed[0], removed[-1], list(added)
+        elif added and prev_ctx is not None:
+            start = end = prev_ctx[0]
+            repl = [prev_ctx[1], *added]
+        elif added and next_ctx is not None:
+            start = end = next_ctx[0]
+            repl = [*added, next_ctx[1]]
+        else:
+            removed, added = [], []
+            return
+        out.append(DiffSuggestion(hunk.file, start, end, "\n".join(repl), raw_hunk))
+        removed, added = [], []
+
+    for hline in hunk.lines[1:]:
         if hline.startswith("-"):
-            if first_changed_line is None:
-                first_changed_line = cur_line
-            cur_line += 1
+            removed.append(old_no)
+            old_no += 1
         elif hline.startswith("+"):
-            if first_changed_line is None:
-                first_changed_line = cur_line
-            added_lines.append(hline[1:])
-        elif hline.startswith(" "):
-            if first_changed_line is not None and added_lines:
-                break
-            cur_line += 1
+            added.append(hline[1:])
+        elif hline.startswith("\\"):
+            continue
+        else:
+            ctx = (old_no, hline[1:] if hline.startswith(" ") else hline)
+            if removed or added:
+                flush(ctx)
+            prev_ctx = ctx
+            old_no += 1
+    if removed or added:
+        flush(None)
+    return out
 
-    effective_line = first_changed_line if first_changed_line is not None else old_start
-    replacement_code = "\n".join(added_lines)
-    raw_hunk = "\n".join(hunk_lines)
-    return (target_file, effective_line, replacement_code, raw_hunk)
+
+def extract_diff_suggestions(patch_diff: str) -> list[DiffSuggestion]:
+    """Return one suggestion per contiguous change group across ALL hunks and files."""
+    if not patch_diff.strip():
+        return []
+    suggestions: list[DiffSuggestion] = []
+    for hunk in _parse_hunks(patch_diff):
+        suggestions.extend(_suggestions_for_hunk(hunk))
+    return suggestions
+
+
+def extract_diff_suggestion(patch_diff: str) -> tuple[str, int, str, str] | None:
+    """Return `(target_file, changed_line, replacement_code, raw_hunk)` for the first change."""
+    suggestions = extract_diff_suggestions(patch_diff)
+    if not suggestions:
+        return None
+    first = suggestions[0]
+    return (first.file, first.start_line, first.replacement_code, first.raw_hunk)
 
 
 def format_verified_patch_comment(
@@ -78,6 +160,7 @@ def format_verified_patch_comment(
     finding: Finding | None,
     replacement_code: str,
     raw_hunk: str,
+    start_line: int | None = None,
 ) -> PostedReviewComment:
     """Format a verified patch as a GitHub PR suggestion block (` ```suggestion `)."""
     cat = finding.category if finding is not None else "verified_fix"
@@ -86,14 +169,14 @@ def format_verified_patch_comment(
         if finding is not None
         else "Automated fix verified in sandbox pytest suite."
     )
+    span = f"{start_line}-{line}" if start_line is not None and start_line < line else f"{line}"
+    suggestion_lines = ["```suggestion", *([replacement_code] if replacement_code else []), "```"]
     body_lines = [
-        f"**PatchPilot Verified Fix** (`{cat}` at `{file}:{line}`)",
+        f"**PatchPilot Verified Fix** (`{cat}` at `{file}:{span}`)",
         "",
         explanation,
         "",
-        "```suggestion",
-        replacement_code,
-        "```",
+        *suggestion_lines,
         "",
         "<details><summary>Verified Unified Diff Hunk</summary>",
         "",
@@ -102,9 +185,13 @@ def format_verified_patch_comment(
         "```",
         "</details>",
     ]
+    end_line = max(1, line)
+    begin = max(1, start_line) if start_line is not None else None
     return PostedReviewComment(
         path=file,
-        line=max(1, line),
+        line=end_line,
+        start_line=begin if begin is not None and begin < end_line else None,
+        side="RIGHT",
         body="\n".join(body_lines),
         verified_suggestion=True,
     )
@@ -133,35 +220,44 @@ def format_review_comments(
 ) -> list[PostedReviewComment]:
     """Build the list of PR review comments from findings and any verified patch."""
     comments: list[PostedReviewComment] = []
-    extracted = extract_diff_suggestion(reported_patch) if reported_patch.strip() else None
+    suggestions = extract_diff_suggestions(reported_patch)
+    used: set[int] = set()
 
-    matched_finding_idx: int | None = None
-    if extracted is not None:
-        patch_file, patch_line, replacement_code, raw_hunk = extracted
-        # Pair the verified patch with the primary fixable/LLM finding on that file if present
-        for idx, f in enumerate(findings):
-            if f.file == patch_file and f.category not in ("F401", "E501"):
-                matched_finding_idx = idx
+    assigned: dict[int, int] = {}
+    # Pass 1: findings whose line falls inside a suggestion's range
+    for si, sug in enumerate(suggestions):
+        for i, f in enumerate(findings):
+            if i not in used and f.file == sug.file and sug.start_line <= f.line <= sug.end_line:
+                assigned[si] = i
+                used.add(i)
                 break
-        if matched_finding_idx is None:
-            for idx, f in enumerate(findings):
-                if f.file == patch_file:
-                    matched_finding_idx = idx
-                    break
+    # Pass 2: fall back to the primary (non-lint) finding on the same file, then any
+    for si, sug in enumerate(suggestions):
+        if si in assigned:
+            continue
+        candidates = [i for i, f in enumerate(findings) if i not in used and f.file == sug.file]
+        preferred = [i for i in candidates if findings[i].category not in ("F401", "E501")]
+        pool = preferred or candidates
+        if pool:
+            chosen = pool[0]
+            assigned[si] = chosen
+            used.add(chosen)
 
-        paired_finding = findings[matched_finding_idx] if matched_finding_idx is not None else None
+    for si, sug in enumerate(suggestions):
+        idx = assigned.get(si)
         comments.append(
             format_verified_patch_comment(
-                file=patch_file,
-                line=patch_line,
-                finding=paired_finding,
-                replacement_code=replacement_code,
-                raw_hunk=raw_hunk,
+                file=sug.file,
+                line=sug.end_line,
+                start_line=sug.start_line,
+                finding=findings[idx] if idx is not None else None,
+                replacement_code=sug.replacement_code,
+                raw_hunk=sug.raw_hunk,
             )
         )
 
     for idx, f in enumerate(findings):
-        if idx == matched_finding_idx:
+        if idx in used:
             continue
         comments.append(format_unverified_finding_comment(f))
 

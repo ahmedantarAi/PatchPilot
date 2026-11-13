@@ -5,7 +5,9 @@ from __future__ import annotations
 import base64
 import os
 import re
+from collections.abc import Iterable
 from typing import Any
+from urllib.parse import quote, urlsplit
 
 import httpx
 from pydantic import BaseModel, Field
@@ -39,6 +41,8 @@ class PostedReviewComment(BaseModel):
     path: str
     line: int
     body: str
+    start_line: int | None = None
+    side: str = "RIGHT"
     verified_suggestion: bool = False
 
 
@@ -56,6 +60,14 @@ def parse_repo_slug(repo_arg: str) -> str:
 def read_github_token_from_env() -> str:
     """Read `GITHUB_TOKEN` strictly from the environment."""
     return (os.environ.get("GITHUB_TOKEN") or "").strip()
+
+
+def quote_repo_path(path: str) -> str:
+    """Percent-encode each path segment while keeping `/` separators intact."""
+    return "/".join(quote(seg, safe="") for seg in path.split("/"))
+
+
+MAX_LIST_PAGES = 30
 
 
 def _redact_token(text: str, token: str) -> str:
@@ -112,7 +124,7 @@ class GitHubClient:
     async def _get(
         self, path: str, *, accept: str = "application/vnd.github+json"
     ) -> httpx.Response:
-        url = f"{self.base_url}{path}"
+        url = path if path.startswith(("http://", "https://")) else f"{self.base_url}{path}"
         try:
             async with httpx.AsyncClient(
                 timeout=self.timeout_s, transport=self._transport
@@ -131,7 +143,53 @@ class GitHubClient:
             )
         return resp
 
-    async def fetch_pull_request(self, repo: str, pr_number: int) -> PullRequestContext:
+    def _is_same_origin(self, url: str) -> bool:
+        a, b = urlsplit(url), urlsplit(self.base_url)
+        return (a.scheme, a.netloc) == (b.scheme, b.netloc)
+
+    async def _get_json_pages(self, path: str) -> list[Any]:
+        """GET a list endpoint with `per_page=100`, following `Link: rel="next"` headers."""
+        sep = "&" if "?" in path else "?"
+        next_url: str | None = f"{path}{sep}per_page=100"
+        items: list[Any] = []
+        for _ in range(MAX_LIST_PAGES):
+            if next_url is None:
+                break
+            resp = await self._get(next_url)
+            try:
+                page = resp.json()
+            except ValueError:
+                break
+            if isinstance(page, list):
+                items.extend(page)
+            candidate = resp.links.get("next", {}).get("url")
+            # Never forward the token to a foreign origin.
+            next_url = candidate if candidate and self._is_same_origin(candidate) else None
+        return items
+
+    async def fetch_file(self, repo: str, path: str, ref: str = "") -> str | None:
+        """Fetch one repository file (changed or unchanged) at `ref`; `None` if unavailable."""
+        slug = parse_repo_slug(repo)
+        ref_query = f"?ref={quote(ref, safe='')}" if ref else ""
+        try:
+            resp = await self._get(f"/repos/{slug}/contents/{quote_repo_path(path)}{ref_query}")
+            data = resp.json()
+        except (GitHubError, ValueError):
+            return None
+        if not isinstance(data, dict) or not isinstance(data.get("content"), str):
+            return None
+        raw = str(data["content"])
+        if str(data.get("encoding", "base64")).lower() == "base64":
+            return base64.b64decode(raw).decode("utf-8", errors="replace")
+        return raw
+
+    async def fetch_pull_request(
+        self,
+        repo: str,
+        pr_number: int,
+        *,
+        extra_paths: Iterable[str] = (),
+    ) -> PullRequestContext:
         """Fetch PR metadata, unified diff, and changed Python file contents via GitHub REST API."""
         slug = parse_repo_slug(repo)
         if pr_number < 1:
@@ -163,43 +221,30 @@ class GitHubClient:
         pr_diff = diff_resp.text
 
         # 3. Fetch changed files list and their contents at head_sha
-        files_resp = await self._get(f"/repos/{slug}/pulls/{pr_number}/files")
-        try:
-            files_list = files_resp.json()
-        except ValueError:
-            files_list = []
+        files_list = await self._get_json_pages(f"/repos/{slug}/pulls/{pr_number}/files")
 
         repo_files: dict[str, str] = {}
-        if isinstance(files_list, list):
-            for item in files_list:
-                if not isinstance(item, dict):
-                    continue
-                filename = str(item.get("filename", "")).strip()
-                status = str(item.get("status", "modified")).lower()
-                if not filename or status == "removed":
-                    continue
+        for item in files_list:
+            if not isinstance(item, dict):
+                continue
+            filename = str(item.get("filename", "")).strip()
+            status = str(item.get("status", "modified")).lower()
+            if not filename or status == "removed":
+                continue
+            if isinstance(item.get("content"), str):
+                repo_files[filename] = str(item["content"])
+                continue
+            fetched = await self.fetch_file(slug, filename, head_sha)
+            if fetched is not None:
+                repo_files[filename] = fetched
 
-                # Use inline content if provided; otherwise query contents API
-                if isinstance(item.get("content"), str):
-                    repo_files[filename] = str(item["content"])
-                    continue
-
-                ref_query = f"?ref={head_sha}" if head_sha else ""
-                try:
-                    c_resp = await self._get(f"/repos/{slug}/contents/{filename}{ref_query}")
-                    c_data = c_resp.json()
-                    if isinstance(c_data, dict) and isinstance(c_data.get("content"), str):
-                        encoding = str(c_data.get("encoding", "base64")).lower()
-                        raw_content = str(c_data["content"])
-                        if encoding == "base64":
-                            decoded = base64.b64decode(raw_content).decode(
-                                "utf-8", errors="replace"
-                            )
-                            repo_files[filename] = decoded
-                        else:
-                            repo_files[filename] = raw_content
-                except GitHubError:
-                    continue
+        # Unchanged files needed for cross-file context / SEARCH-REPLACE normalization
+        for extra in extra_paths:
+            extra = extra.strip()
+            if extra and extra not in repo_files:
+                fetched = await self.fetch_file(slug, extra, head_sha)
+                if fetched is not None:
+                    repo_files[extra] = fetched
 
         return PullRequestContext(
             repo=slug,
@@ -230,14 +275,16 @@ class GitHubClient:
 
         review_comments: list[dict[str, Any]] = []
         for c in comments:
-            review_comments.append(
-                {
-                    "path": c.path,
-                    "line": max(1, c.line),
-                    "side": "RIGHT",
-                    "body": c.body,
-                }
-            )
+            entry: dict[str, Any] = {
+                "path": c.path,
+                "line": max(1, c.line),
+                "side": "RIGHT",
+                "body": c.body,
+            }
+            if c.start_line is not None and 1 <= c.start_line < c.line:
+                entry["start_line"] = c.start_line
+                entry["start_side"] = "RIGHT"
+            review_comments.append(entry)
 
         payload: dict[str, Any] = {
             "event": "COMMENT",

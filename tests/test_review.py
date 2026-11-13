@@ -215,3 +215,226 @@ def test_extract_diff_suggestion_and_repo_slug_parsing() -> None:
     assert line_no == 11
     assert replacement == "    return x >= 5"
     assert "@@ -10,4 +10,4 @@" in raw_hunk
+
+
+# ---------------------------------------------------------------------------
+# Regression tests: multi-hunk RIGHT mapping, pagination, path encoding, privacy
+# ---------------------------------------------------------------------------
+
+from patchpilot.pipeline.models import Finding  # noqa: E402
+from patchpilot.review import extract_diff_suggestions, format_review_comments  # noqa: E402
+from patchpilot.review.github import PostedReviewComment, quote_repo_path  # noqa: E402
+
+_MULTI_HUNK_PATCH = (
+    "--- a/pkg/mod.py\n"
+    "+++ b/pkg/mod.py\n"
+    "@@ -2,3 +2,3 @@\n"
+    " a = 1\n"
+    "-b = 2\n"
+    "+b = 22\n"
+    " c = 3\n"
+    "@@ -20,4 +20,5 @@\n"
+    " def f():\n"
+    "-    return 1\n"
+    "-    # old\n"
+    "+    x = 1\n"
+    "+    return x\n"
+    " \n"
+    "@@ -40,2 +41,3 @@\n"
+    " tail = 1\n"
+    "+tail2 = 2\n"
+    " end = 0\n"
+)
+
+
+def test_multi_hunk_patch_maps_every_hunk_to_right_side_ranges() -> None:
+    sugs = extract_diff_suggestions(_MULTI_HUNK_PATCH)
+    assert [(s.file, s.start_line, s.end_line) for s in sugs] == [
+        ("pkg/mod.py", 3, 3),
+        ("pkg/mod.py", 21, 22),
+        ("pkg/mod.py", 40, 40),  # pure insertion anchors on preceding context line
+    ]
+    assert sugs[0].replacement_code == "b = 22"
+    assert sugs[1].replacement_code == "    x = 1\n    return x"
+    assert sugs[2].replacement_code == "tail = 1\ntail2 = 2"
+    # backward-compatible single-suggestion API returns the first change
+    assert extract_diff_suggestion(_MULTI_HUNK_PATCH) == (
+        "pkg/mod.py",
+        3,
+        "b = 22",
+        sugs[0].raw_hunk,
+    )
+
+
+def test_multi_file_patch_and_comment_formatting_uses_start_line_right_side() -> None:
+    patch = _MULTI_HUNK_PATCH + (
+        "--- a/other.py\n+++ b/other.py\n@@ -1,2 +1,1 @@\n-gone = 1\n keep = 2\n"
+    )
+    findings = [
+        Finding(file="pkg/mod.py", line=21, category="logic", explanation="range finding"),
+    ]
+    comments = format_review_comments(findings, patch)
+    verified = [c for c in comments if c.verified_suggestion]
+    assert len(verified) == 4
+    ranged = [c for c in verified if c.start_line is not None]
+    assert len(ranged) == 1
+    assert (ranged[0].start_line, ranged[0].line, ranged[0].side) == (21, 22, "RIGHT")
+    assert "range finding" in ranged[0].body
+    deletion = [c for c in verified if c.path == "other.py"][0]
+    assert deletion.line == 1
+    assert "```suggestion\n```" in deletion.body
+    assert all(c.side == "RIGHT" for c in comments)
+
+
+def test_post_review_comments_sends_start_line_and_right_side() -> None:
+    posted: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        posted.append(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(200, json={})
+
+    client = GitHubClient(token="ghp_x_token_12345", transport=httpx.MockTransport(handler))
+    comments = [
+        PostedReviewComment(path="a.py", line=22, start_line=21, body="multi"),
+        PostedReviewComment(path="a.py", line=5, body="single"),
+    ]
+    assert asyncio.run(client.post_review_comments("o/r", 1, comments)) == 2
+    sent = posted[0]["comments"]
+    assert isinstance(sent, list)
+    assert sent[0]["start_line"] == 21 and sent[0]["start_side"] == "RIGHT"
+    assert sent[0]["line"] == 22 and sent[0]["side"] == "RIGHT"
+    assert "start_line" not in sent[1]
+
+
+def test_pr_files_pagination_follows_link_next_and_fetches_extra_file() -> None:
+    seen: list[str] = []
+    total = 45
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        path = request.url.path
+        if path == "/repos/o/r/pulls/3":
+            if "diff" in request.headers.get("Accept", ""):
+                return httpx.Response(200, text="")
+            return httpx.Response(
+                200,
+                json={"head": {"sha": "h1"}, "base": {"sha": "b1", "repo": {"private": True}}},
+            )
+        if path == "/repos/o/r/pulls/3/files":
+            page = int(request.url.params.get("page", "1"))
+            assert request.url.params.get("per_page") == "100" or page > 1
+            names = [f"f{i}.py" for i in range(total)]
+            chunk = names[(page - 1) * 30 : page * 30]
+            headers = {}
+            if page * 30 < total:
+                nxt = f"https://api.github.com/repos/o/r/pulls/3/files?per_page=100&page={page + 1}"
+                headers["Link"] = f'<{nxt}>; rel="next"'
+            return httpx.Response(
+                200,
+                json=[{"filename": n, "status": "added", "content": "x = 1\n"} for n in chunk],
+                headers=headers,
+            )
+        if path == "/repos/o/r/contents/lib/unchanged.py":
+            assert request.url.params.get("ref") == "h1"
+            return httpx.Response(
+                200,
+                json={"content": base64.b64encode(b"u = 1\n").decode(), "encoding": "base64"},
+            )
+        return httpx.Response(404, json={})
+
+    client = GitHubClient(token="ghp_tok_pag_123456", transport=httpx.MockTransport(handler))
+    ctx = asyncio.run(client.fetch_pull_request("o/r", 3, extra_paths=["lib/unchanged.py"]))
+    assert len([k for k in ctx.files if k.startswith("f")]) == total
+    assert ctx.files["lib/unchanged.py"] == "u = 1\n"
+    assert sum("/pulls/3/files" in u for u in seen) == 2
+
+
+def test_pagination_does_not_follow_foreign_origin_link() -> None:
+    seen_hosts: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_hosts.append(request.url.host)
+        if request.url.path.endswith("/files"):
+            return httpx.Response(
+                200,
+                json=[],
+                headers={"Link": '<https://evil.example/steal>; rel="next"'},
+            )
+        if request.url.path == "/repos/o/r/pulls/3":
+            return httpx.Response(200, json={"head": {"sha": "h"}, "base": {"repo": {}}})
+        return httpx.Response(200, text="")
+
+    client = GitHubClient(token="ghp_tok_origin_1234", transport=httpx.MockTransport(handler))
+    asyncio.run(client.fetch_pull_request("o/r", 3))
+    assert "evil.example" not in seen_hosts
+
+
+def test_file_paths_are_url_encoded_per_segment() -> None:
+    assert quote_repo_path("dir one/a#b/c%d?.py") == "dir%20one/a%23b/c%25d%3F.py"
+    raw_paths: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raw = request.url.raw_path.decode("ascii")
+        if "/contents/" in raw:
+            raw_paths.append(raw)
+            return httpx.Response(
+                200, json={"content": base64.b64encode(b"ok\n").decode(), "encoding": "base64"}
+            )
+        if raw.startswith("/repos/o/r/pulls/9/files"):
+            return httpx.Response(
+                200, json=[{"filename": "my dir/we#ird %name?.py", "status": "modified"}]
+            )
+        if raw == "/repos/o/r/pulls/9":
+            return httpx.Response(200, json={"head": {"sha": "s1"}, "base": {"repo": {}}})
+        return httpx.Response(200, text="")
+
+    secret = "ghp_secret_for_encoding_test"
+    client = GitHubClient(token=secret, transport=httpx.MockTransport(handler))
+    ctx = asyncio.run(client.fetch_pull_request("o/r", 9))
+    assert ctx.files["my dir/we#ird %name?.py"] == "ok\n"
+    assert raw_paths == ["/repos/o/r/contents/my%20dir/we%23ird%20%25name%3F.py?ref=s1"]
+    assert secret not in repr(client) and secret not in str(client)
+
+
+@pytest.mark.parametrize("dirname", ["fixtures", "evals", "my_evals_fixtures"])
+def test_local_repo_dir_defaults_to_private_even_for_fixtures_and_evals(
+    tmp_path: Path, dirname: str
+) -> None:
+    from patchpilot.providers.base import LLMRequest
+
+    repo = tmp_path / dirname / "case"
+    repo.mkdir(parents=True)
+    (repo / "m.py").write_text("import os\n\ndef f():\n    return 1\n", encoding="utf-8")
+
+    class Spy(MockProvider):
+        classes: list[str] = []
+
+        async def generate(self, request: LLMRequest):  # type: ignore[no-untyped-def]
+            Spy.classes.append(request.data_class)
+            return await super().generate(request)
+
+    Spy.classes = []
+    asyncio.run(
+        run_review(
+            repo_dir=repo,
+            dry_run=True,
+            provider_name="mock",
+            provider_override=Spy(canned="x"),
+            verify_fn=_fast_verify,
+        )
+    )
+    assert Spy.classes, "expected at least one LLM call"
+    assert set(Spy.classes) == {"private"}
+
+    Spy.classes = []
+    asyncio.run(
+        run_review(
+            repo_dir=repo,
+            dry_run=True,
+            provider_name="mock",
+            provider_override=Spy(canned="x"),
+            verify_fn=_fast_verify,
+            assume_public=True,
+        )
+    )
+    assert set(Spy.classes) == {"public"}

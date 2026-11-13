@@ -132,6 +132,7 @@ async def _review_command(
     dry_run: bool,
     provider_name: str,
     report_out: str | None,
+    assume_public: bool = False,
 ) -> int:
     from patchpilot.review.github import GitHubError
     from patchpilot.review.runner import run_review
@@ -144,6 +145,7 @@ async def _review_command(
             dry_run=dry_run,
             provider_name=provider_name,
             report_out=Path(report_out) if report_out else None,
+            assume_public=assume_public,
         )
     except (GitHubError, ValueError, FileNotFoundError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
@@ -214,6 +216,12 @@ def main() -> None:
         help="Optional path to write full JSON review report",
     )
 
+    review_parser.add_argument(
+        "--assume-public",
+        action="store_true",
+        help="Declare a local --repo-dir as public data (default: private, local models only)",
+    )
+
     args = parser.parse_args()
 
     if args.subcommand == "run":
@@ -231,6 +239,7 @@ def main() -> None:
                 dry_run=bool(args.dry_run),
                 provider_name=args.provider,
                 report_out=args.out,
+                assume_public=bool(args.assume_public),
             )
         )
         sys.exit(exit_code)

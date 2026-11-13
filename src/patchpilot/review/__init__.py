@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from patchpilot.review.formatter import (
     extract_diff_suggestion,
+    extract_diff_suggestions,
     format_review_comments,
     format_unverified_finding_comment,
     format_verified_patch_comment,
@@ -27,6 +28,7 @@ __all__ = [
     "PullRequestContext",
     "ReviewResult",
     "extract_diff_suggestion",
+    "extract_diff_suggestions",
     "format_review_comments",
     "format_unverified_finding_comment",
     "format_verified_patch_comment",

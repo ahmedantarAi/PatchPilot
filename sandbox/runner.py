@@ -21,10 +21,10 @@ import sys
 import tarfile
 import tempfile
 import threading
-import xml.etree.ElementTree as ET
+import xml.parsers.expat as expat
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import IO, Any
+from typing import IO, Any, NoReturn
 
 MAX_OUTPUT_BYTES = 1_048_576  # 1 MB cap per SPEC §6
 MAX_PATCH_BYTES = 10 * 1024 * 1024  # 10 MB max patch size
@@ -489,11 +489,65 @@ def read_stream_capped(stream: IO[bytes], cap_bytes: int = MAX_OUTPUT_BYTES) -> 
     return b"".join(chunks).decode("utf-8", errors="replace"), truncated
 
 
-def parse_junit_xml(xml_text: str) -> dict[str, Any]:
-    """Parse pytest JUnit XML into a small structured summary dictionary with caps.
+class _HostileXMLError(ValueError):
+    """Raised when JUnit XML contains forbidden DOCTYPE, ENTITY, or external DTD constructs."""
 
-    Safely handles or rejects hostile XML (e.g. DOCTYPE/entity expansion declarations).
-    """
+
+_PINNED_REQ_RE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._-]*(\[[A-Za-z0-9,._-]+\])?==[A-Za-z0-9.+!-]+$"
+)
+_HASH_OPT_RE = re.compile(r"^--hash=sha256:[a-fA-F0-9]{64}$")
+_FORBIDDEN_REQ_SUBSTRINGS = ("http://", "https://", "git+", "file://", "..", "@", "/", "\\", ";")
+
+
+def _validate_requirements_lines(raw_lines: list[str]) -> list[str]:
+    """Validate that every requirement uses an exact `==` pin (plus optional sha256 hashes)."""
+    logical_lines: list[str] = []
+    pending: list[str] = []
+    for raw in raw_lines:
+        stripped_line = raw.rstrip("\r\n")
+        no_comment = re.sub(r"(^|\s)#.*$", "", stripped_line).strip()
+        if not no_comment:
+            if pending:
+                logical_lines.append(" ".join(pending))
+                pending.clear()
+            continue
+        if no_comment.endswith("\\"):
+            part = no_comment[:-1].strip()
+            if part:
+                pending.append(part)
+            continue
+        pending.append(no_comment)
+        logical_lines.append(" ".join(pending))
+        pending.clear()
+    if pending:
+        logical_lines.append(" ".join(pending))
+
+    cleaned: list[str] = []
+    for line in logical_lines:
+        tokens = line.split()
+        spec = tokens[0]
+        lower_spec = spec.lower()
+        if spec.startswith("-"):
+            raise ValueError(f"Pip option flags are forbidden in requirements: {line!r}")
+        if any(bad in lower_spec for bad in _FORBIDDEN_REQ_SUBSTRINGS) or ":" in spec:
+            raise ValueError(f"Paths and URLs are forbidden in requirements: {line!r}")
+        if not _PINNED_REQ_RE.match(spec):
+            raise ValueError(f"Requirement must be an exact 'pkg==version' pin: {line!r}")
+
+        for opt in tokens[1:]:
+            if any(bad in opt.lower() for bad in _FORBIDDEN_REQ_SUBSTRINGS):
+                raise ValueError(f"Paths and URLs are forbidden in requirements: {line!r}")
+            if not _HASH_OPT_RE.match(opt):
+                raise ValueError(
+                    f"Only '--hash=sha256:<64-hex>' options are allowed with pins: {line!r}"
+                )
+        cleaned.append(" ".join(tokens))
+    return cleaned
+
+
+def parse_junit_xml(xml_text: str) -> dict[str, Any]:
+    """Parse pytest JUnit XML using a non-DTD expat parser with strict size/count caps."""
     summary: dict[str, Any] = {
         "tests": 0,
         "failures": 0,
@@ -505,71 +559,152 @@ def parse_junit_xml(xml_text: str) -> dict[str, Any]:
     if not xml_text.strip():
         return summary
 
+    if len(xml_text.encode("utf-8")) > MAX_OUTPUT_BYTES:
+        summary["error"] = f"Hostile or oversized XML: exceeds {MAX_OUTPUT_BYTES} byte limit"
+        return summary
+
     # Reject DOCTYPE / ENTITY declarations which are never legitimate in pytest JUnit XML
     xml_lower = xml_text.lower()
     if "<!doctype" in xml_lower or "<!entity" in xml_lower:
         summary["error"] = "Hostile XML: DOCTYPE/ENTITY declarations rejected"
         return summary
 
+    cases_list: list[dict[str, Any]] = []
+    counts = {"tests": 0, "failures": 0, "errors": 0, "skipped": 0}
+
+    stack: list[str] = []
+    tc_depth: int | None = None
+    tc_attrs: dict[str, str] = {}
+    tc_details: dict[str, str] = {}
+    active_detail_kind: str | None = None
+    active_detail_depth: int = -1
+    active_detail_msg_attr: str = ""
+    active_detail_chunks: list[str] = []
+    active_detail_len: int = 0
+
+    def _reject_dtd(*_args: Any) -> NoReturn:
+        raise _HostileXMLError("Hostile XML: DOCTYPE/ENTITY declarations rejected")
+
+    def _on_start_element(name: str, attrs: dict[str, str]) -> None:
+        nonlocal tc_depth, tc_attrs, tc_details
+        nonlocal active_detail_kind, active_detail_depth, active_detail_msg_attr
+        nonlocal active_detail_chunks, active_detail_len
+
+        stack.append(name)
+        depth = len(stack)
+        if name == "testcase" and tc_depth is None:
+            tc_depth = depth
+            tc_attrs = dict(attrs)
+            tc_details = {}
+        elif (
+            tc_depth is not None
+            and depth == tc_depth + 1
+            and name in ("failure", "error", "skipped")
+            and active_detail_kind is None
+            and name not in tc_details
+        ):
+            active_detail_kind = name
+            active_detail_depth = depth
+            active_detail_msg_attr = attrs.get("message") or ""
+            active_detail_chunks = []
+            active_detail_len = 0
+
+    def _on_char_data(data: str) -> None:
+        nonlocal active_detail_len
+        if active_detail_kind is not None and active_detail_len < MAX_JUNIT_MSG_LEN:
+            remaining = MAX_JUNIT_MSG_LEN - active_detail_len
+            snippet = data[:remaining]
+            active_detail_chunks.append(snippet)
+            active_detail_len += len(snippet)
+
+    def _on_end_element(name: str) -> None:
+        nonlocal tc_depth, tc_attrs, tc_details
+        nonlocal active_detail_kind, active_detail_depth, active_detail_msg_attr
+        nonlocal active_detail_chunks, active_detail_len
+
+        depth = len(stack)
+        if (
+            active_detail_kind is not None
+            and depth == active_detail_depth
+            and name == active_detail_kind
+        ):
+            raw_msg = active_detail_msg_attr or "".join(active_detail_chunks)
+            tc_details[active_detail_kind] = raw_msg[:MAX_JUNIT_MSG_LEN]
+            active_detail_kind = None
+            active_detail_depth = -1
+            active_detail_msg_attr = ""
+            active_detail_chunks = []
+            active_detail_len = 0
+        elif tc_depth is not None and depth == tc_depth and name == "testcase":
+            counts["tests"] += 1
+            status = "passed"
+            message: str | None = None
+            if "failure" in tc_details:
+                status = "failed"
+                counts["failures"] += 1
+                message = tc_details["failure"]
+            elif "error" in tc_details:
+                status = "error"
+                counts["errors"] += 1
+                message = tc_details["error"]
+            elif "skipped" in tc_details:
+                status = "skipped"
+                counts["skipped"] += 1
+                message = tc_details["skipped"]
+
+            if len(cases_list) < MAX_JUNIT_CASES:
+                classname = (tc_attrs.get("classname", "") or "")[:MAX_JUNIT_STR_LEN]
+                tc_name = (tc_attrs.get("name", "") or "")[:MAX_JUNIT_STR_LEN]
+                try:
+                    time_s = float(tc_attrs.get("time", "0") or "0")
+                except ValueError:
+                    time_s = 0.0
+                cases_list.append(
+                    {
+                        "classname": classname,
+                        "name": tc_name,
+                        "time": time_s,
+                        "status": status,
+                        "message": message,
+                    }
+                )
+            tc_depth = None
+            tc_attrs = {}
+            tc_details = {}
+
+        if stack:
+            stack.pop()
+
+    parser = expat.ParserCreate("utf-8")
+    parser.SetParamEntityParsing(expat.XML_PARAM_ENTITY_PARSING_NEVER)
+    parser.StartDoctypeDeclHandler = _reject_dtd
+    parser.EntityDeclHandler = _reject_dtd
+    parser.UnparsedEntityDeclHandler = _reject_dtd
+    parser.NotationDeclHandler = _reject_dtd
+    parser.ElementDeclHandler = _reject_dtd
+    parser.AttlistDeclHandler = _reject_dtd
+    parser.ExternalEntityRefHandler = _reject_dtd
+    parser.StartElementHandler = _on_start_element
+    parser.EndElementHandler = _on_end_element
+    parser.CharacterDataHandler = _on_char_data
+
     try:
-        root = ET.fromstring(xml_text)
-    except Exception as exc:
+        parser.Parse(xml_text, True)
+    except _HostileXMLError as exc:
+        summary["error"] = str(exc)
+        return summary
+    except expat.ExpatError as exc:
         summary["error"] = f"XMLParseError: {exc}"
         return summary
 
-    cases_list: list[dict[str, Any]] = []
-    tests_total = 0
-    failures_total = 0
-    errors_total = 0
-    skipped_total = 0
-
-    for tc in root.findall(".//testcase"):
-        tests_total += 1
-        failure_el = tc.find("failure")
-        error_el = tc.find("error")
-        skipped_el = tc.find("skipped")
-
-        status = "passed"
-        message: str | None = None
-        if failure_el is not None:
-            status = "failed"
-            failures_total += 1
-            msg_raw = failure_el.attrib.get("message") or failure_el.text or ""
-            message = msg_raw[:MAX_JUNIT_MSG_LEN]
-        elif error_el is not None:
-            status = "error"
-            errors_total += 1
-            msg_raw = error_el.attrib.get("message") or error_el.text or ""
-            message = msg_raw[:MAX_JUNIT_MSG_LEN]
-        elif skipped_el is not None:
-            status = "skipped"
-            skipped_total += 1
-            msg_raw = skipped_el.attrib.get("message") or skipped_el.text or ""
-            message = msg_raw[:MAX_JUNIT_MSG_LEN]
-
-        if len(cases_list) < MAX_JUNIT_CASES:
-            classname = (tc.attrib.get("classname", "") or "")[:MAX_JUNIT_STR_LEN]
-            name = (tc.attrib.get("name", "") or "")[:MAX_JUNIT_STR_LEN]
-            try:
-                time_s = float(tc.attrib.get("time", "0") or "0")
-            except ValueError:
-                time_s = 0.0
-
-            cases_list.append(
-                {
-                    "classname": classname,
-                    "name": name,
-                    "time": time_s,
-                    "status": status,
-                    "message": message,
-                }
-            )
-
-    passed_total = max(0, tests_total - failures_total - errors_total - skipped_total)
-    summary["tests"] = tests_total
-    summary["failures"] = failures_total
-    summary["errors"] = errors_total
-    summary["skipped"] = skipped_total
+    passed_total = max(
+        0,
+        counts["tests"] - counts["failures"] - counts["errors"] - counts["skipped"],
+    )
+    summary["tests"] = counts["tests"]
+    summary["failures"] = counts["failures"]
+    summary["errors"] = counts["errors"]
+    summary["skipped"] = counts["skipped"]
     summary["passed"] = passed_total
     summary["cases"] = cases_list
     return summary
@@ -719,9 +854,28 @@ def run_install_deps() -> int:
             ]
         }
     raw_reqs = payload.get("requirements", [])
-    requirements: list[str] = (
-        [str(r) for r in raw_reqs if isinstance(r, str)] if isinstance(raw_reqs, list) else []
-    )
+    if not isinstance(raw_reqs, list) or not all(isinstance(r, str) for r in raw_reqs):
+        err_obj = {
+            "exit_code": 2,
+            "cmd": [],
+            "stdout": "",
+            "stderr": "Payload 'requirements' must be a list of strings",
+        }
+        sys.stdout.write(json.dumps(err_obj) + "\n")
+        sys.stdout.flush()
+        return 2
+    try:
+        requirements = _validate_requirements_lines(raw_reqs)
+    except ValueError as exc:
+        err_obj = {
+            "exit_code": 2,
+            "cmd": [],
+            "stdout": "",
+            "stderr": f"Invalid requirement specification: {exc}",
+        }
+        sys.stdout.write(json.dumps(err_obj) + "\n")
+        sys.stdout.flush()
+        return 2
     raw_links = payload.get("find_links")
     find_links: str | None = str(raw_links) if isinstance(raw_links, str) and raw_links else None
 

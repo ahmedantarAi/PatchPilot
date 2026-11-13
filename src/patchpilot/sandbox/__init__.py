@@ -36,6 +36,7 @@ from patchpilot.sandbox.runner import (
     remove_deps_volume,
     validate_deps_volume_name,
     validate_requirements,
+    validate_requirements_file,
 )
 from patchpilot.sandbox.tar_and_diff import (
     MAX_OUTPUT_BYTES,
@@ -109,6 +110,7 @@ __all__ = [
     "validate_deps_volume_name",
     "validate_junit_summary",
     "validate_requirements",
+    "validate_requirements_file",
     "validate_safe_relative_path",
     "verify_install_step_no_repo_code",
     "verify_single_run_lock",

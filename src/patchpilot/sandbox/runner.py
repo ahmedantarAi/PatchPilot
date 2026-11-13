@@ -39,9 +39,9 @@ DEFAULT_TIMEOUT_S = 120.0
 DEFAULT_LOCK_PATH = Path(tempfile.gettempdir()) / "patchpilot-sandbox.lock"
 
 DEPS_VOLUME_RE = re.compile(r"^patchpilot-deps-[a-f0-9]{12,64}$")
-PINNED_REQ_RE = re.compile(
-    r"^[A-Za-z0-9][A-Za-z0-9._-]*(\[[A-Za-z0-9,._-]+\])?==[A-Za-z0-9.*+!-]+$"
-)
+PINNED_REQ_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*(\[[A-Za-z0-9,._-]+\])?==[A-Za-z0-9.+!-]+$")
+HASH_OPT_RE = re.compile(r"^--hash=sha256:[a-fA-F0-9]{64}$")
+FORBIDDEN_REQ_SUBSTRINGS = ("http://", "https://", "git+", "file://", "..", "@", "/", "\\", ";")
 
 SANDBOX_LIMITS: dict[str, object] = {
     "network": "none",
@@ -50,7 +50,8 @@ SANDBOX_LIMITS: dict[str, object] = {
     "security_opt": "no-new-privileges",
     "read_only": True,
     "tmpfs_work": "/work:rw,nosuid,size=256m,uid=10001,gid=10001",
-    "tmpfs_tmp": "/tmp:rw,noexec,nosuid,size=128m",
+    # Container-only tmpfs mount specification (not host /tmp directory usage).
+    "tmpfs_tmp": "/tmp:rw,noexec,nosuid,size=128m",  # nosec B108
     "memory": "768m",
     "memory_swap": "768m",
     "cpus": "1",
@@ -208,20 +209,55 @@ class SandboxLock:
 
 
 def validate_requirements(requirements: Sequence[str]) -> list[str]:
-    """Validate that requirements are strictly pinned specifiers (no paths, URLs, or flags)."""
-    cleaned: list[str] = []
+    """Validate that requirements use exact `==` pins (with optional `--hash=sha256:...`)."""
+    logical_lines: list[str] = []
+    pending: list[str] = []
     for raw in requirements:
-        line = raw.strip()
-        if not line or line.startswith("#"):
+        stripped_line = raw.rstrip("\r\n")
+        no_comment = re.sub(r"(^|\s)#.*$", "", stripped_line).strip()
+        if not no_comment:
+            if pending:
+                logical_lines.append(" ".join(pending))
+                pending.clear()
             continue
-        if line.startswith("-"):
+        if no_comment.endswith("\\"):
+            part = no_comment[:-1].strip()
+            if part:
+                pending.append(part)
+            continue
+        pending.append(no_comment)
+        logical_lines.append(" ".join(pending))
+        pending.clear()
+    if pending:
+        logical_lines.append(" ".join(pending))
+
+    cleaned: list[str] = []
+    for line in logical_lines:
+        tokens = line.split()
+        spec = tokens[0]
+        lower_spec = spec.lower()
+        if spec.startswith("-"):
             raise ValueError(f"Pip option flags are forbidden in requirements: {line!r}")
-        if "/" in line or "\\" in line or ".." in line or ":" in line or "@" in line:
+        if any(bad in lower_spec for bad in FORBIDDEN_REQ_SUBSTRINGS) or ":" in spec:
             raise ValueError(f"Paths and URLs are forbidden in requirements: {line!r}")
-        if not PINNED_REQ_RE.match(line):
+        if not PINNED_REQ_RE.match(spec):
             raise ValueError(f"Requirement must be an exact 'pkg==version' pin: {line!r}")
-        cleaned.append(line)
+
+        for opt in tokens[1:]:
+            if any(bad in opt.lower() for bad in FORBIDDEN_REQ_SUBSTRINGS):
+                raise ValueError(f"Paths and URLs are forbidden in requirements: {line!r}")
+            if not HASH_OPT_RE.match(opt):
+                raise ValueError(
+                    f"Only '--hash=sha256:<64-hex>' options are allowed with pins: {line!r}"
+                )
+        cleaned.append(" ".join(tokens))
     return cleaned
+
+
+def validate_requirements_file(req_path: Path) -> list[str]:
+    """Read and strictly validate a `requirements.txt` file before sandbox dependency install."""
+    content = req_path.read_text(encoding="utf-8")
+    return validate_requirements(content.splitlines())
 
 
 def compute_deps_volume_name(requirements: Sequence[str]) -> str:
@@ -280,9 +316,9 @@ def build_docker_run_cmd(
     cmd.extend(
         [
             "--tmpfs",
-            "/work:rw,nosuid,size=256m,uid=10001,gid=10001",
+            str(SANDBOX_LIMITS["tmpfs_work"]),
             "--tmpfs",
-            "/tmp:rw,noexec,nosuid,size=128m",
+            str(SANDBOX_LIMITS["tmpfs_tmp"]),
             "--memory",
             str(memory),
             "--memory-swap",
@@ -331,9 +367,9 @@ def build_docker_install_cmd(
         "no-new-privileges",
         "--read-only",
         "--tmpfs",
-        "/work:rw,nosuid,size=256m,uid=10001,gid=10001",
+        str(SANDBOX_LIMITS["tmpfs_work"]),
         "--tmpfs",
-        "/tmp:rw,noexec,nosuid,size=128m",
+        str(SANDBOX_LIMITS["tmpfs_tmp"]),
         "--memory",
         "768m",
         "--memory-swap",
@@ -496,15 +532,19 @@ class SandboxRunner:
 
     def install_dependencies_sync(
         self,
-        requirements: Sequence[str],
+        requirements: Sequence[str] = (),
         *,
+        requirements_file: Path | None = None,
         find_links: str | None = None,
         find_links_host_dir: str | Path | None = None,
         network: str = "bridge",
         timeout_s: float | None = None,
     ) -> InstallStepResult:
         """Populate a `patchpilot-deps-<sha256>` volume with binary wheels and no repo files."""
-        validated = validate_requirements(requirements)
+        combined_reqs = list(requirements)
+        if requirements_file is not None:
+            combined_reqs.extend(validate_requirements_file(requirements_file))
+        validated = validate_requirements(combined_reqs)
         volume_name = compute_deps_volume_name(validated)
         effective_timeout = timeout_s if timeout_s is not None else self.timeout_s
         container_name = f"{SANDBOX_CONTAINER_PREFIX}deps-{uuid.uuid4().hex[:12]}"

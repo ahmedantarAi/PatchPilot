@@ -446,7 +446,7 @@ def verify_single_run_lock(lock_path: Path | None = None) -> None:
         # 2. Cross-process contention: hold OS file lock in a child process
         src_root = str(Path(__file__).resolve().parent.parent.parent)
         child_code = (
-            "import sys, time\n"
+            "import os, sys, threading\n"
             f"sys.path.insert(0, {src_root!r})\n"
             "from pathlib import Path\n"
             "from patchpilot.sandbox.runner import SandboxLock\n"
@@ -454,10 +454,17 @@ def verify_single_run_lock(lock_path: Path | None = None) -> None:
             "with SandboxLock(lock_file):\n"
             "    sys.stdout.write('LOCKED\\n')\n"
             "    sys.stdout.flush()\n"
-            "    time.sleep(5.0)\n"
+            "    timer = threading.Timer(5.0, lambda: os._exit(0))\n"
+            "    timer.daemon = True\n"
+            "    timer.start()\n"
+            "    try:\n"
+            "        sys.stdin.read(1)\n"
+            "    finally:\n"
+            "        timer.cancel()\n"
         )
         child = subprocess.Popen(
             [sys.executable, "-c", child_code, str(effective_lock)],
+            stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -477,8 +484,16 @@ def verify_single_run_lock(lock_path: Path | None = None) -> None:
             except SandboxBusyError:
                 pass
         finally:
-            child.kill()
-            child.wait(timeout=5.0)
+            if child.stdin is not None:
+                try:
+                    child.stdin.close()
+                except OSError:
+                    pass
+            try:
+                child.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.wait(timeout=5.0)
 
 
 def build_test_wheels_and_sdists(dest_dir: Path) -> tuple[Path, Path]:

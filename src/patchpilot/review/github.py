@@ -16,10 +16,31 @@ GITHUB_API_BASE_URL = "https://api.github.com"
 _REPO_SLUG_RE = re.compile(
     r"^(?:https?://github\.com/)?([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(?:\.git)?/?$"
 )
+_GH_TOKEN_RE = re.compile(r"(?:gh[pousr]_[A-Za-z0-9_]{8,}|github_pat_[A-Za-z0-9_]{8,})")
+
+
+def read_github_token_from_env() -> str:
+    """Read `GITHUB_TOKEN` strictly from the environment."""
+    return (os.environ.get("GITHUB_TOKEN") or "").strip()
+
+
+def _redact_token(text: str, token: str = "") -> str:
+    out = text
+    for candidate in (token, read_github_token_from_env()):
+        if candidate:
+            out = out.replace(candidate, "***REDACTED***")
+            encoded = quote(candidate, safe="")
+            if encoded and encoded != candidate:
+                out = out.replace(encoded, "***REDACTED***")
+    out = _GH_TOKEN_RE.sub("***REDACTED***", out)
+    return out
 
 
 class GitHubError(RuntimeError):
     """Raised when GitHub API requests fail or required credentials are missing."""
+
+    def __init__(self, message: str = "") -> None:
+        super().__init__(_redact_token(str(message)))
 
 
 class PullRequestContext(BaseModel):
@@ -57,23 +78,12 @@ def parse_repo_slug(repo_arg: str) -> str:
     return match.group(1)
 
 
-def read_github_token_from_env() -> str:
-    """Read `GITHUB_TOKEN` strictly from the environment."""
-    return (os.environ.get("GITHUB_TOKEN") or "").strip()
-
-
 def quote_repo_path(path: str) -> str:
     """Percent-encode each path segment while keeping `/` separators intact."""
     return "/".join(quote(seg, safe="") for seg in path.split("/"))
 
 
 MAX_LIST_PAGES = 30
-
-
-def _redact_token(text: str, token: str) -> str:
-    if not token:
-        return text
-    return text.replace(token, "***REDACTED***")
 
 
 class GitHubClient:
@@ -144,24 +154,35 @@ class GitHubClient:
         return resp
 
     def _is_same_origin(self, url: str) -> bool:
+        if url.startswith("/") and not url.startswith("//"):
+            return True
         a, b = urlsplit(url), urlsplit(self.base_url)
-        return (a.scheme, a.netloc) == (b.scheme, b.netloc)
+        return (a.scheme.lower(), a.netloc.lower()) == (b.scheme.lower(), b.netloc.lower())
+
+    def _normalize_page_url(self, url: str) -> str:
+        return url if url.startswith(("http://", "https://")) else f"{self.base_url}{url}"
 
     async def _get_json_pages(self, path: str) -> list[Any]:
         """GET a list endpoint with `per_page=100`, following `Link: rel="next"` headers."""
         sep = "&" if "?" in path else "?"
-        next_url: str | None = f"{path}{sep}per_page=100"
+        next_url: str | None = path if "per_page=" in path else f"{path}{sep}per_page=100"
         items: list[Any] = []
+        visited: set[str] = set()
         for _ in range(MAX_LIST_PAGES):
             if next_url is None:
                 break
+            norm_url = self._normalize_page_url(next_url)
+            if norm_url in visited:
+                break
+            visited.add(norm_url)
             resp = await self._get(next_url)
             try:
                 page = resp.json()
             except ValueError:
                 break
-            if isinstance(page, list):
-                items.extend(page)
+            if not isinstance(page, list):
+                break
+            items.extend(page)
             candidate = resp.links.get("next", {}).get("url")
             # Never forward the token to a foreign origin.
             next_url = candidate if candidate and self._is_same_origin(candidate) else None

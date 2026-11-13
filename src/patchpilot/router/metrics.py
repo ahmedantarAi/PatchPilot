@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
+from patchpilot.providers.base import _sanitize_token_count
 from patchpilot.router.policy import RouteTarget
 
 # Standard reference token pricing for Gemini Flash ($0.10 / 1M input, $0.40 / 1M output).
@@ -16,8 +17,8 @@ OLLAMA_OUTPUT_COST_PER_1M_USD = 0.00
 
 def estimate_call_cost_usd(
     target: RouteTarget,
-    prompt_tokens: int,
-    completion_tokens: int,
+    prompt_tokens: int | None,
+    completion_tokens: int | None,
     *,
     input_cost_per_1m: float = GEMINI_INPUT_COST_PER_1M_USD,
     output_cost_per_1m: float = GEMINI_OUTPUT_COST_PER_1M_USD,
@@ -25,9 +26,11 @@ def estimate_call_cost_usd(
     """Compute estimated API cost in USD for a single LLM generation call."""
     if target == "local":
         return 0.0
-    p_tok = max(0, prompt_tokens)
-    c_tok = max(0, completion_tokens)
-    cost = (p_tok / 1_000_000.0) * input_cost_per_1m + (c_tok / 1_000_000.0) * output_cost_per_1m
+    p_tok = _sanitize_token_count(prompt_tokens)
+    c_tok = _sanitize_token_count(completion_tokens)
+    in_rate = max(0.0, float(input_cost_per_1m))
+    out_rate = max(0.0, float(output_cost_per_1m))
+    cost = (p_tok / 1_000_000.0) * in_rate + (c_tok / 1_000_000.0) * out_rate
     return round(cost, 8)
 
 
@@ -47,6 +50,11 @@ class RoutingDecision(BaseModel):
     completion_tokens: int = 0
     estimated_cost_usd: float = 0.0
     hypothetical_frontier_cost_usd: float = 0.0
+
+    @field_validator("prompt_tokens", "completion_tokens", mode="before")
+    @classmethod
+    def _coerce_non_negative_tokens(cls, value: object) -> int:
+        return _sanitize_token_count(value)
 
 
 class RouterMetricsSummary(BaseModel):

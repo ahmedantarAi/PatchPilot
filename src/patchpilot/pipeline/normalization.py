@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import difflib
+import posixpath
 import re
 import tempfile
 import textwrap
@@ -14,25 +15,34 @@ from pathlib import Path, PurePosixPath
 from patchpilot.sandbox.tar_and_diff import PatchApplyError, apply_unified_diff
 
 SEARCH_REPLACE_PATTERN = re.compile(
-    r"(?:^[ \t]*(?:#+|//+|\*+|File:)?\s*([a-zA-Z0-9_./\\-]+\.[a-zA-Z0-9]+)\s*\n)?"
-    r"^[ \t]*<{7}\s*SEARCH(?::\s*([a-zA-Z0-9_./\\-]+))?(?:[ \t]+([a-zA-Z0-9_./\\-]+))?[ \t]*\n"
+    r"(?:^[ \t]*(?:#+|//+|\*+|File:)?[ \t]*"
+    r"([a-zA-Z0-9_./\\-]+\.[a-zA-Z0-9]+)[ \t]*\r?\n)?"
+    r"^[ \t]*<{7}[ \t]*SEARCH(?::[ \t]*([a-zA-Z0-9_./\\-]+))?"
+    r"(?:[ \t]+([a-zA-Z0-9_./\\-]+))?[ \t]*\r?\n"
     r"(.*?)"
-    r"^[ \t]*={7}[ \t]*\n"
+    r"^[ \t]*={7}[ \t]*\r?\n"
     r"(.*?)"
-    r"^[ \t]*>{7}\s*REPLACE[ \t]*$",
+    r"^[ \t]*>{7}[ \t]*REPLACE[ \t]*\r?$",
     re.MULTILINE | re.DOTALL,
 )
+
+_SEARCH_HEADER_RE = re.compile(r"^[ \t]*<{7}[ \t]*SEARCH\b", re.MULTILINE)
+_REPLACE_FOOTER_RE = re.compile(r"^[ \t]*>{7}[ \t]*REPLACE\b", re.MULTILINE)
 
 
 def _clean_rel_path(raw_path: str) -> str:
     """Normalize a diff or file header path to a clean POSIX relative path."""
-    cleaned = raw_path.split("\t", 1)[0].replace("\\", "/").strip()
+    cleaned = raw_path.split("\t", 1)[0].strip().strip("\"'").replace("\\", "/").strip()
     if cleaned == "/dev/null":
         return "/dev/null"
     if cleaned.startswith("a/") or cleaned.startswith("b/"):
         cleaned = cleaned[2:]
     while cleaned.startswith("./"):
         cleaned = cleaned[2:]
+    if cleaned and cleaned != "/dev/null" and not cleaned.startswith("/"):
+        normed = posixpath.normpath(cleaned)
+        if normed != ".":
+            cleaned = normed
     return cleaned
 
 
@@ -42,13 +52,13 @@ def is_test_file(rel_path: str) -> bool:
     if not cleaned or cleaned == "/dev/null":
         return False
     posix = PurePosixPath(cleaned)
-    name = posix.name
-    parts = posix.parts
+    name = posix.name.lower()
+    parts_lower = [p.lower() for p in posix.parts[:-1]]
     return (
         name.startswith("test_")
         or name.endswith("_test.py")
         or name == "conftest.py"
-        or "tests" in parts[:-1]
+        or "tests" in parts_lower
     )
 
 
@@ -56,6 +66,8 @@ def is_modifiable_py_file(rel_path: str) -> bool:
     """Return True if `rel_path` is a non-test Python source file eligible for modification."""
     cleaned = _clean_rel_path(rel_path)
     if not cleaned or cleaned == "/dev/null":
+        return False
+    if cleaned.startswith("/") or ":" in cleaned.split("/", 1)[0] or ".." in cleaned.split("/"):
         return False
     return cleaned.endswith(".py") and not is_test_file(cleaned)
 
@@ -69,6 +81,8 @@ def check_forbidden_patch_path(rel_path: str) -> str | None:
         return f"Reward-hacking guard: patch is not allowed to touch test file {cleaned!r}"
     if not cleaned.endswith(".py"):
         return f"Reward-hacking guard: patch is not allowed to touch non-.py file {cleaned!r}"
+    if cleaned.startswith("/") or ":" in cleaned.split("/", 1)[0] or ".." in cleaned.split("/"):
+        return f"Reward-hacking guard: patch is not allowed to touch unsafe path {cleaned!r}"
     return None
 
 
@@ -108,7 +122,7 @@ def validate_patch_targets(diff_text: str) -> None:
 def _has_patch_markers(block_lines: list[str]) -> bool:
     """Return True if fenced block lines contain SEARCH/REPLACE or unified diff headers."""
     block_text = "".join(block_lines)
-    if "<<<<<<< SEARCH" in block_text:
+    if _SEARCH_HEADER_RE.search(block_text):
         return True
     has_old = any(ln.startswith("--- ") for ln in block_lines)
     has_new = any(ln.startswith("+++ ") for ln in block_lines)
@@ -120,9 +134,9 @@ def _strip_markdown_code_fences(text: str) -> str:
 
     Blank lines outside fenced blocks (leading, trailing, or between consecutive blocks) are
     ignored; blank lines inside a block are preserved verbatim. Consecutive fenced blocks are
-    concatenated. When a short prose preamble precedes fenced blocks, any fenced blocks
-    containing SEARCH/REPLACE or unified diff headers are extracted. Text without matching
-    fenced blocks is returned unchanged.
+    concatenated. When a short prose preamble or inter-block prose accompanies fenced blocks,
+    any fenced blocks containing SEARCH/REPLACE or unified diff headers are extracted. Text
+    without matching fenced blocks is returned unchanged.
     """
     lines = text.splitlines(keepends=True)
     idx = 0
@@ -141,6 +155,21 @@ def _strip_markdown_code_fences(text: str) -> str:
             idx += 1  # skip closing fence (no-op if unterminated)
             while idx < len(lines) and not lines[idx].strip():
                 idx += 1
+        while idx < len(lines):
+            if lines[idx].strip().startswith("```"):
+                idx += 1
+                extra_lines: list[str] = []
+                while idx < len(lines) and lines[idx].strip() != "```":
+                    extra_lines.append(lines[idx])
+                    idx += 1
+                if idx < len(lines) and lines[idx].strip() == "```":
+                    idx += 1
+                if _has_patch_markers(extra_lines):
+                    if out and not out[-1].endswith(("\n", "\r")):
+                        out.append("\n")
+                    out.extend(extra_lines)
+            else:
+                idx += 1
         return "".join(out)
 
     # Prose preamble before fenced blocks: extract fenced blocks with patch markers.
@@ -157,7 +186,7 @@ def _strip_markdown_code_fences(text: str) -> str:
                 i += 1
             if _has_patch_markers(block_lines):
                 block_str = "".join(block_lines)
-                if extracted_blocks and not extracted_blocks[-1].endswith("\n"):
+                if extracted_blocks and not extracted_blocks[-1].endswith(("\n", "\r")):
                     extracted_blocks.append("\n")
                 extracted_blocks.append(block_str)
         else:
@@ -252,6 +281,44 @@ def _reindent_replace_block(
     return out
 
 
+def _scan_uniform_prefix_hits(
+    orig_raw: list[str],
+    s_ded_lines: list[str],
+) -> list[tuple[int, int, str]]:
+    """Scan `orig_raw` for windows matching `s_ded_lines` with a uniform whitespace prefix."""
+    k = len(s_ded_lines)
+    if k == 0 or k > len(orig_raw):
+        return []
+
+    hits: list[tuple[int, int, str]] = []
+    for i in range(len(orig_raw) - k + 1):
+        prefix: str | None = None
+        ok = True
+        for w_ln, s_ln in zip(orig_raw[i : i + k], s_ded_lines, strict=True):
+            if not s_ln.strip():
+                if w_ln.strip():
+                    ok = False
+                    break
+                continue
+            w_r = w_ln.rstrip()
+            s_r = s_ln.rstrip()
+            if not w_r.endswith(s_r):
+                ok = False
+                break
+            cand_prefix = w_r[: len(w_r) - len(s_r)]
+            if any(ch not in (" ", "\t") for ch in cand_prefix):
+                ok = False
+                break
+            if prefix is None:
+                prefix = cand_prefix
+            elif cand_prefix != prefix:
+                ok = False
+                break
+        if ok and prefix is not None:
+            hits.append((i, i + k, prefix))
+    return hits
+
+
 def _has_if_elif_mismatch(w_stripped: list[str], s_stripped: list[str]) -> bool:
     """Return True if any aligned replacement pairs an `if` line with an `elif` line."""
     matcher = difflib.SequenceMatcher(None, w_stripped, s_stripped)
@@ -285,7 +352,7 @@ def _try_tier1_exact(
     replace_block: str,
 ) -> _TierScanResult:
     """Tier 1: Line-aligned exact or \\r\\n-normalized match with unique-match enforcement."""
-    if not search_block:
+    if not search_block or not search_block.strip():
         return _TierScanResult(status="none")
 
     orig_lines = _split_lines_preserve(orig_content)
@@ -336,6 +403,9 @@ def _try_tier2_rstrip(
     replace_block: str,
 ) -> _TierScanResult:
     """Tier 2: Line-rstrip() match preserving exact leading indentation; require count == 1."""
+    if not search_block or not search_block.strip():
+        return _TierScanResult(status="none")
+
     orig_lines = _split_lines_preserve(orig_content)
     orig_raw = [ln.rstrip("\r\n") for ln in orig_lines]
     search_raw = [ln.rstrip("\r\n") for ln in _split_lines_preserve(search_block)]
@@ -370,6 +440,9 @@ def _try_tier3_uniform_indent(
     replace_block: str,
 ) -> _TierScanResult:
     """Tier 3: Uniform indentation-delta match for >= 2 non-empty lines, preserving tabs/spaces."""
+    if not search_block or not search_block.strip():
+        return _TierScanResult(status="none")
+
     orig_lines = _split_lines_preserve(orig_content)
     orig_raw = [ln.rstrip("\r\n") for ln in orig_lines]
     search_raw = [ln.rstrip("\r\n") for ln in _split_lines_preserve(search_block)]
@@ -382,32 +455,7 @@ def _try_tier3_uniform_indent(
     if k == 0 or k > len(orig_raw):
         return _TierScanResult(status="none")
 
-    hits: list[tuple[int, int, str]] = []
-    for i in range(len(orig_raw) - k + 1):
-        prefix: str | None = None
-        ok = True
-        for w_ln, s_ln in zip(orig_raw[i : i + k], s_ded_lines, strict=True):
-            if not s_ln.strip():
-                if w_ln.strip():
-                    ok = False
-                    break
-                continue
-            w_r = w_ln.rstrip()
-            s_r = s_ln.rstrip()
-            if not w_r.endswith(s_r):
-                ok = False
-                break
-            cand_prefix = w_r[: len(w_r) - len(s_r)]
-            if any(ch not in (" ", "\t") for ch in cand_prefix):
-                ok = False
-                break
-            if prefix is None:
-                prefix = cand_prefix
-            elif cand_prefix != prefix:
-                ok = False
-                break
-        if ok and prefix is not None:
-            hits.append((i, i + k, prefix))
+    hits = _scan_uniform_prefix_hits(orig_raw, s_ded_lines)
 
     if not hits:
         return _TierScanResult(status="none")
@@ -434,6 +482,9 @@ def _try_tier4_ast_fuzzy(
     validate_ast: bool = True,
 ) -> _TierScanResult:
     """Tier 4: AST-anchored fuzzy fallback (>=3 non-empty lines, ratio>=0.85, margin>=0.10)."""
+    if not search_block or not search_block.strip():
+        return _TierScanResult(status="none")
+
     orig_lines = _split_lines_preserve(orig_content)
     orig_raw = [ln.rstrip("\r\n") for ln in orig_lines]
     search_raw = [ln.rstrip("\r\n") for ln in _split_lines_preserve(search_block)]
@@ -644,11 +695,13 @@ def _find_target_file(
             return cleaned
         if cleaned in files:
             return cleaned
-        suffix_matches = [
-            f
-            for f in files
-            if f.replace("\\", "/") == cleaned or f.replace("\\", "/").endswith(f"/{cleaned}")
-        ]
+        suffix_matches = _dedupe_match_keys(
+            [
+                f
+                for f in files
+                if _clean_rel_path(f) == cleaned or _clean_rel_path(f).endswith(f"/{cleaned}")
+            ]
+        )
         if len(suffix_matches) == 1:
             return suffix_matches[0]
         if len(suffix_matches) > 1:
@@ -709,6 +762,12 @@ def _apply_search_replace_block(
     target: str,
 ) -> str:
     """Apply a single SEARCH/REPLACE block via 4-tier matching with unique-match enforcement."""
+    if not search_block or not search_block.strip():
+        raise ValueError(
+            f"Empty SEARCH block in {target}: SEARCH block must contain at least one "
+            "non-whitespace line"
+        )
+
     tier_fns: tuple[Callable[[], _TierScanResult], ...] = (
         lambda: _try_tier1_exact(orig_content, search_block, replace_block),
         lambda: _try_tier2_rstrip(orig_content, search_block, replace_block),
@@ -736,6 +795,38 @@ def _apply_search_replace_block(
     raise ValueError(f"Search block not found in {target}: {search_block[:50]!r}\n{feedback}")
 
 
+def _apply_unified_diff_to_mapping(
+    diff_text: str,
+    base_files: dict[str, str],
+) -> dict[str, str]:
+    """Apply `diff_text` to a copy of `base_files` in a temporary directory and return result."""
+    validate_patch_targets(diff_text)
+    with tempfile.TemporaryDirectory() as tmp:
+        work_dir = Path(tmp)
+        key_by_clean: dict[str, str] = {}
+        for rel_path, content in base_files.items():
+            clean_rel = _clean_rel_path(rel_path)
+            if not clean_rel or clean_rel == "/dev/null":
+                continue
+            key_by_clean.setdefault(clean_rel, rel_path)
+            dest = work_dir / clean_rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_text(content.replace("\r\n", "\n").replace("\r", "\n"), encoding="utf-8")
+
+        try:
+            apply_unified_diff(diff_text, work_dir)
+        except PatchApplyError as exc:
+            raise ValueError(f"Failed to apply unified diff: {exc}") from exc
+
+        updated: dict[str, str] = {}
+        for disk_file in work_dir.rglob("*"):
+            if disk_file.is_file():
+                rel_disk = disk_file.relative_to(work_dir).as_posix()
+                orig_key = key_by_clean.get(rel_disk, rel_disk)
+                updated[orig_key] = disk_file.read_text(encoding="utf-8")
+        return updated
+
+
 def normalize_search_replace(
     raw_text: str,
     files: dict[str, str],
@@ -756,6 +847,16 @@ def normalize_search_replace(
             explicit_reason = check_forbidden_patch_path(explicit_file)
             if explicit_reason is not None:
                 raise ValueError(explicit_reason)
+
+        if _SEARCH_HEADER_RE.search(search_block) or _SEARCH_HEADER_RE.search(replace_block):
+            raise ValueError("Malformed SEARCH/REPLACE block: nested or unclosed delimiter")
+        if _REPLACE_FOOTER_RE.search(search_block) or _REPLACE_FOOTER_RE.search(replace_block):
+            raise ValueError("Malformed SEARCH/REPLACE block: nested or unclosed delimiter")
+
+        if not search_block or not search_block.strip():
+            raise ValueError(
+                "Empty SEARCH block: SEARCH block must contain at least one non-whitespace line"
+            )
 
         target = _find_target_file(search_block, explicit_file, working_files)
         if not target:
@@ -783,19 +884,65 @@ def normalize_search_replace(
             raise ValueError(f"Target file {target!r} not found in repository")
 
         orig_content = working_files[target]
-        working_files[target] = _apply_search_replace_block(
+        new_target_content = _apply_search_replace_block(
             orig_content, search_block, replace_block, target=target
         )
+        working_files[target] = new_target_content
+        # Keep any path aliases (e.g. './mod.py' vs 'mod.py') in sync in working_files
+        clean_target = _clean_rel_path(target)
+        for alias_key in list(working_files):
+            if alias_key != target and _clean_rel_path(alias_key) == clean_target:
+                working_files[alias_key] = new_target_content
         changed_files.add(target)
 
+    # Check if text outside matched SEARCH/REPLACE blocks also contains a unified diff
+    remaining_chunks: list[str] = []
+    last_end = 0
+    for m in matches:
+        remaining_chunks.append(text[last_end : m.start()])
+        last_end = m.end()
+    remaining_chunks.append(text[last_end:])
+    remaining_text = "\n".join(remaining_chunks)
+
+    if _SEARCH_HEADER_RE.search(remaining_text) or _REPLACE_FOOTER_RE.search(remaining_text):
+        raise ValueError("Malformed SEARCH/REPLACE block: unmatched delimiter in output")
+
+    if re.search(r"^--- \S+", remaining_text, re.MULTILINE) and re.search(
+        r"^\+\+\+ \S+", remaining_text, re.MULTILINE
+    ):
+        validate_patch_targets(remaining_text)
+        if re.search(r"^@@ -\d+", remaining_text, re.MULTILINE):
+            try:
+                updated_from_diff = _apply_unified_diff_to_mapping(remaining_text, working_files)
+                for k, v in updated_from_diff.items():
+                    orig_norm = files.get(k, "").replace("\r\n", "\n").replace("\r", "\n")
+                    if v.replace("\r\n", "\n").replace("\r", "\n") != orig_norm:
+                        working_files[k] = v
+                        changed_files.add(k)
+            except ValueError:
+                # Check if the unified diff was a redundant representation of the same change
+                updated_from_orig = _apply_unified_diff_to_mapping(remaining_text, files)
+                for k, v in updated_from_orig.items():
+                    orig_norm = files.get(k, "").replace("\r\n", "\n").replace("\r", "\n")
+                    if (
+                        v.replace("\r\n", "\n").replace("\r", "\n") != orig_norm
+                        and k not in changed_files
+                    ):
+                        working_files[k] = v
+                        changed_files.add(k)
+
     canonical_diff = ""
+    seen_clean_paths: set[str] = set()
     for path in sorted(changed_files):
         reason = check_forbidden_patch_path(path)
         if reason is not None:
             raise ValueError(reason)
-        orig_lines = files[path].splitlines(keepends=True)
+        rel_posix = _clean_rel_path(path)
+        if rel_posix in seen_clean_paths:
+            continue
+        seen_clean_paths.add(rel_posix)
+        orig_lines = files[path].splitlines(keepends=True) if path in files else []
         new_lines = working_files[path].splitlines(keepends=True)
-        rel_posix = path.replace("\\", "/")
         diff_lines = list(
             difflib.unified_diff(
                 orig_lines,
@@ -821,54 +968,47 @@ def normalize_unified_diff(
     if not text.strip():
         return ""
 
-    # Enforce reward-hacking guard on diff headers before applying
-    validate_patch_targets(text)
+    updated_files = _apply_unified_diff_to_mapping(text, files)
+    all_paths = set(files.keys()) | set(updated_files.keys())
 
-    with tempfile.TemporaryDirectory() as tmp:
-        work_dir = Path(tmp)
-        for rel_path, content in files.items():
-            dest = work_dir / rel_path
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            dest.write_text(content, encoding="utf-8")
-
-        try:
-            apply_unified_diff(text, work_dir)
-        except PatchApplyError as exc:
-            raise ValueError(f"Failed to apply unified diff: {exc}") from exc
-
-        all_paths = set(files.keys())
-        for disk_file in work_dir.rglob("*"):
-            if disk_file.is_file():
-                rel_disk = disk_file.relative_to(work_dir).as_posix()
-                all_paths.add(rel_disk)
-
-        canonical_diff = ""
-        for rel_path in sorted(all_paths):
-            orig_lines = files[rel_path].splitlines(keepends=True) if rel_path in files else []
-            new_file = work_dir / rel_path
-            if new_file.is_file():
-                new_lines = new_file.read_text(encoding="utf-8").splitlines(keepends=True)
-            else:
-                new_lines = []
-            if orig_lines != new_lines:
-                reason = check_forbidden_patch_path(rel_path)
-                if reason is not None:
-                    raise ValueError(reason)
-                rel_posix = rel_path.replace("\\", "/")
-                diff_lines = list(
-                    difflib.unified_diff(
-                        orig_lines,
-                        new_lines,
-                        fromfile=f"a/{rel_posix}",
-                        tofile=f"b/{rel_posix}",
-                    )
+    canonical_diff = ""
+    seen_clean_paths: set[str] = set()
+    for rel_path in sorted(all_paths):
+        rel_posix = _clean_rel_path(rel_path)
+        if not rel_posix or rel_posix in seen_clean_paths:
+            continue
+        orig_lines = (
+            files[rel_path].replace("\r\n", "\n").replace("\r", "\n").splitlines(keepends=True)
+            if rel_path in files
+            else []
+        )
+        new_lines = (
+            updated_files[rel_path]
+            .replace("\r\n", "\n")
+            .replace("\r", "\n")
+            .splitlines(keepends=True)
+            if rel_path in updated_files
+            else []
+        )
+        if orig_lines != new_lines:
+            reason = check_forbidden_patch_path(rel_path)
+            if reason is not None:
+                raise ValueError(reason)
+            seen_clean_paths.add(rel_posix)
+            diff_lines = list(
+                difflib.unified_diff(
+                    orig_lines,
+                    new_lines,
+                    fromfile=f"a/{rel_posix}",
+                    tofile=f"b/{rel_posix}",
                 )
-                canonical_diff += "".join(diff_lines)
+            )
+            canonical_diff += "".join(diff_lines)
 
-        if canonical_diff.strip():
-            validate_patch_targets(canonical_diff)
+    if canonical_diff.strip():
+        validate_patch_targets(canonical_diff)
 
-        return canonical_diff
+    return canonical_diff
 
 
 def normalize_patch(
@@ -880,7 +1020,7 @@ def normalize_patch(
     if not text.strip():
         return ""
 
-    if "<<<<<<< SEARCH" in text and ">>>>>>> REPLACE" in text:
+    if SEARCH_REPLACE_PATTERN.search(text):
         return normalize_search_replace(text, files)
 
     if "--- " in text and "+++ " in text:

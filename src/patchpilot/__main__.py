@@ -9,14 +9,14 @@ import logging
 import sys
 from pathlib import Path
 
-from patchpilot.config import Settings
+from patchpilot.config import PROJECT_ROOT, Settings
 from patchpilot.pipeline.graph import run_pipeline
 from patchpilot.pipeline.models import PipelineRunSummary, PipelineState
 from patchpilot.providers import get_provider
-from patchpilot.providers.base import LLMProvider
+from patchpilot.providers.base import LLMProvider, ProviderError
 from patchpilot.providers.mock import MockProvider
-from patchpilot.retrieval import HashEmbedder, OllamaEmbedder, QdrantStore
-from patchpilot.sandbox.runner import SandboxRunner
+from patchpilot.retrieval import Embedder, HashEmbedder, OllamaEmbedder, QdrantStore
+from patchpilot.sandbox.runner import SandboxError, SandboxRunner
 from patchpilot.tracing import run_trace_smoke
 
 logging.basicConfig(level=logging.WARNING, format="%(levelname)s: %(message)s")
@@ -25,15 +25,23 @@ logger = logging.getLogger("patchpilot.cli")
 
 def _resolve_case_dir(case_arg: str) -> Path:
     """Resolve a case argument (e.g. 'seeded_eval/0001' or '0001') to its directory."""
-    raw = Path(case_arg)
+    cleaned = case_arg.strip()
+    if not cleaned or cleaned in (".", ".."):
+        raise FileNotFoundError(f"Case directory not found for {case_arg!r}")
+
+    raw = Path(cleaned)
     if raw.is_dir():
         return raw
-    candidate1 = Path("evals/datasets") / case_arg
-    if candidate1.is_dir():
-        return candidate1
-    candidate2 = Path("evals/datasets/seeded_eval") / case_arg
-    if candidate2.is_dir():
-        return candidate2
+
+    candidates = (
+        Path("evals/datasets") / cleaned,
+        Path("evals/datasets/seeded_eval") / cleaned,
+        PROJECT_ROOT / "evals/datasets" / cleaned,
+        PROJECT_ROOT / "evals/datasets/seeded_eval" / cleaned,
+    )
+    for candidate in candidates:
+        if candidate.is_dir():
+            return candidate
     raise FileNotFoundError(f"Case directory not found for {case_arg!r}")
 
 
@@ -47,7 +55,18 @@ def _load_case_files(case_dir: Path) -> dict[str, str]:
     for p in sorted(repo_dir.rglob("*")):
         if p.is_file():
             rel = str(p.relative_to(repo_dir)).replace("\\", "/")
-            files[rel] = p.read_text(encoding="utf-8")
+            parts = rel.split("/")
+            if (
+                "__pycache__" in parts
+                or ".pytest_cache" in parts
+                or ".git" in parts
+                or rel.endswith(".pyc")
+            ):
+                continue
+            try:
+                files[rel] = p.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                continue
 
     return files
 
@@ -56,13 +75,16 @@ def load_mock_ground_truth(case_dir: Path) -> str:
     """Load ground-truth patch exclusively for the MockProvider path."""
     patch_path = case_dir / "patch.diff"
     if patch_path.is_file():
-        return patch_path.read_text(encoding="utf-8")
+        try:
+            return patch_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            return ""
 
     meta_path = case_dir / "meta.json"
     if meta_path.is_file():
         try:
             meta = json.loads(meta_path.read_text(encoding="utf-8"))
-            if isinstance(meta, dict) and "patch_diff" in meta:
+            if isinstance(meta, dict) and meta.get("patch_diff") is not None:
                 return str(meta["patch_diff"])
         except (ValueError, OSError):
             pass
@@ -71,41 +93,45 @@ def load_mock_ground_truth(case_dir: Path) -> str:
 
 
 async def _run_command(case_arg: str, provider_name: str) -> int:
-    settings = Settings()
-    case_dir = _resolve_case_dir(case_arg)
-    files = _load_case_files(case_dir)
+    try:
+        settings = Settings()
+        case_dir = _resolve_case_dir(case_arg)
+        files = _load_case_files(case_dir)
 
-    # Provider setup: only MockProvider reads ground-truth patch.diff / meta.json
-    provider: LLMProvider
-    if provider_name == "mock":
-        known_patch = load_mock_ground_truth(case_dir)
-        provider = MockProvider(canned=known_patch)
-    else:
-        provider = get_provider(provider_name, settings)  # type: ignore[arg-type]
+        # Provider setup: only MockProvider reads ground-truth patch.diff / meta.json
+        provider: LLMProvider
+        if provider_name == "mock":
+            known_patch = load_mock_ground_truth(case_dir)
+            provider = MockProvider(canned=known_patch)
+        else:
+            provider = get_provider(provider_name, settings)  # type: ignore[arg-type]
 
-    # Embedder setup
-    embedder = (
-        OllamaEmbedder(base_url=settings.ollama_base_url, model=settings.ollama_model)
-        if provider_name == "ollama"
-        else HashEmbedder(dim=64)
-    )
+        # Embedder setup: HashEmbedder for mock/CI, OllamaEmbedder for live providers
+        embedder: Embedder = (
+            HashEmbedder(dim=64)
+            if provider_name == "mock"
+            else OllamaEmbedder(base_url=settings.ollama_base_url, model=settings.ollama_model)
+        )
 
-    qdrant = QdrantStore(base_url="http://127.0.0.1:6333", timeout_s=1.0)
+        qdrant = QdrantStore(base_url="http://127.0.0.1:6333", timeout_s=1.0)
 
-    initial_state = PipelineState(
-        case_id=case_arg,
-        files=files,
-        data_class="public",
-        provider=provider_name,
-    )
+        initial_state = PipelineState(
+            case_id=case_arg,
+            files=files,
+            data_class="public",
+            provider=provider_name,
+        )
 
-    final_state = await run_pipeline(
-        initial_state,
-        provider=provider,
-        sandbox_runner=SandboxRunner(),
-        qdrant=qdrant,
-        embedder=embedder,
-    )
+        final_state = await run_pipeline(
+            initial_state,
+            provider=provider,
+            sandbox_runner=SandboxRunner(),
+            qdrant=qdrant,
+            embedder=embedder,
+        )
+    except (FileNotFoundError, ValueError, ProviderError, SandboxError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
 
     summary = PipelineRunSummary(
         case=case_arg,
@@ -147,7 +173,7 @@ async def _review_command(
             report_out=Path(report_out) if report_out else None,
             assume_public=assume_public,
         )
-    except (GitHubError, ValueError, FileNotFoundError) as exc:
+    except (GitHubError, ProviderError, SandboxError, ValueError, FileNotFoundError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
 
@@ -155,7 +181,7 @@ async def _review_command(
     return 0
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="patchpilot", description="PatchPilot CLI")
     subparsers = parser.add_subparsers(dest="subcommand", required=True)
 
@@ -222,7 +248,7 @@ def main() -> None:
         help="Declare a local --repo-dir as public data (default: private, local models only)",
     )
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     if args.subcommand == "run":
         exit_code = asyncio.run(_run_command(args.case, args.provider))

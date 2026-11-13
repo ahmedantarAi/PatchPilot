@@ -7,7 +7,7 @@ api:
 
 setup:
 	uv sync --frozen
-	@uv run --frozen python -c "import pathlib, sysconfig; sp = pathlib.Path(sysconfig.get_path('purelib')); (sp / 'patchpilot.pth').write_text(str(pathlib.Path('src').resolve()) + '\n')"
+	@uv run --frozen python -c "import pathlib, sysconfig; sp = pathlib.Path(sysconfig.get_path('purelib')); (sp / 'patchpilot.pth').write_text(str(pathlib.Path('src').resolve()) + '\n', encoding='utf-8')"
 
 lint:
 	uv run --frozen ruff check .
@@ -40,7 +40,7 @@ config:
 	docker compose --profile observability config -q
 
 sandbox-build:
-	@uv run --frozen python -c "import pathlib, sysconfig; sp = pathlib.Path(sysconfig.get_path('purelib')); (sp / 'patchpilot.pth').write_text(str(pathlib.Path('src').resolve()) + '\n')"
+	@uv run --frozen python -c "import pathlib, sysconfig; sp = pathlib.Path(sysconfig.get_path('purelib')); (sp / 'patchpilot.pth').write_text(str(pathlib.Path('src').resolve()) + '\n', encoding='utf-8')"
 	docker build -t patchpilot-sandbox:0.0.0 sandbox
 
 clean:

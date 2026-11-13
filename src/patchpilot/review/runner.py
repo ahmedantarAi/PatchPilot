@@ -60,10 +60,11 @@ def _load_local_repo_dir(repo_dir: Path) -> dict[str, str]:
     for p in sorted(target_root.rglob("*")):
         if not p.is_file():
             continue
-        rel = p.relative_to(target_root).as_posix()
+        rel_path = p.relative_to(target_root)
+        rel = rel_path.as_posix()
         if rel in ("patch.diff", "meta.json", "__symlinks__.json"):
             continue
-        if any(part.startswith(".") or part == "__pycache__" for part in p.parts):
+        if any(part.startswith(".") or part == "__pycache__" for part in rel_path.parts):
             continue
         try:
             files[rel] = p.read_text(encoding="utf-8")

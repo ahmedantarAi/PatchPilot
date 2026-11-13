@@ -10,9 +10,13 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
-if (Test-Path '.venv\Lib\site-packages') {
-    Set-Content -Path '.venv\Lib\site-packages\patchpilot.pth' -Value (Resolve-Path 'src').Path -Encoding ascii
+
+function Write-PthFile {
+    if (Test-Path '.venv\Lib\site-packages') {
+        Set-Content -Path '.venv\Lib\site-packages\patchpilot.pth' -Value (Resolve-Path 'src').Path -Encoding ascii
+    }
 }
+Write-PthFile
 
 function Invoke-Step {
     param([string]$Exe, [string[]]$Arguments)
@@ -28,7 +32,7 @@ function Assert-EnvReady {
 switch ($Task) {
     'help'      { 'Tasks: api setup lint typecheck test check up down obs-up obs-down config sandbox-build clean' }
     'api'       { Invoke-Step uv @('run', '--frozen', 'uvicorn', 'patchpilot.api:app', '--host', '127.0.0.1', '--port', '8000') }
-    'setup'     { Invoke-Step uv @('sync', '--frozen') }
+    'setup'     { Invoke-Step uv @('sync', '--frozen'); Write-PthFile }
     'lint'      {
         Invoke-Step uv @('run', '--frozen', 'ruff', 'check', '.')
         Invoke-Step uv @('run', '--frozen', 'ruff', 'format', '--check', '.')
@@ -44,6 +48,6 @@ switch ($Task) {
         Invoke-Step docker @('compose', 'config', '-q')
         Invoke-Step docker @('compose', '--profile', 'observability', 'config', '-q')
     }
-    'sandbox-build' { Invoke-Step docker @('build', '-t', 'patchpilot-sandbox:0.0.0', 'sandbox') }
+    'sandbox-build' { Write-PthFile; Invoke-Step docker @('build', '-t', 'patchpilot-sandbox:0.0.0', 'sandbox') }
     'clean'     { Invoke-Step docker @('compose', '--profile', 'observability', 'down', '-v', '--remove-orphans') }
 }

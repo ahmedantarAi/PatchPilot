@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from patchpilot.evals.freeze import verify_frozen_eval_split
 from patchpilot.evals.generator import load_pool_cases
@@ -52,16 +53,67 @@ def load_run_reports(
     results_dir: Path = Path("evals/results"),
 ) -> list[EvalRunReport]:
     """Load one or more `EvalRunReport` JSON files matching `run_id_or_path`."""
-    direct = Path(run_id_or_path)
+    key = run_id_or_path.strip()
+    if not key:
+        raise FileNotFoundError(
+            f"No evaluation run report JSON files found for {run_id_or_path!r} in {results_dir}"
+        )
+
+    direct = Path(key)
     if direct.is_file():
         return [EvalRunReport.model_validate_json(direct.read_text(encoding="utf-8"))]
 
+    in_results = results_dir / key
+    if in_results.is_file():
+        return [EvalRunReport.model_validate_json(in_results.read_text(encoding="utf-8"))]
+
     if results_dir.is_dir():
-        matches = sorted(results_dir.glob(f"{run_id_or_path}*.json"))
-        if matches:
-            return [
-                EvalRunReport.model_validate_json(p.read_text(encoding="utf-8")) for p in matches
+        prefix = key.rstrip("_")
+        exact_file_re = re.compile(rf"^{re.escape(prefix)}(?:_run\d+)?\.json$")
+        candidates = sorted(results_dir.glob(f"{prefix}*.json"))
+
+        parsed: list[tuple[Path, EvalRunReport]] = []
+        for p in candidates:
+            try:
+                rep = EvalRunReport.model_validate_json(p.read_text(encoding="utf-8"))
+                parsed.append((p, rep))
+            except (ValidationError, ValueError, OSError):
+                continue
+
+        # 1. Prefer exact run_id / exact <run_id>_run<N>.json matches
+        exact_matches = [
+            (p, rep)
+            for p, rep in parsed
+            if rep.run_id == key or rep.run_id == prefix or exact_file_re.match(p.name)
+        ]
+        if exact_matches:
+            exact_matches.sort(key=lambda item: (item[1].run_index, item[0].name))
+            return [rep for _, rep in exact_matches]
+
+        # 2. Boundary-safe prefix matching (e.g. `s1` never matches `s10`)
+        boundary_matches = [
+            (p, rep)
+            for p, rep in parsed
+            if rep.run_id.startswith(f"{prefix}_") or p.stem.startswith(f"{prefix}_")
+        ]
+        if boundary_matches and "_limit" not in key:
+            non_limit = [
+                (p, rep)
+                for p, rep in boundary_matches
+                if "_limit" not in rep.run_id and "_limit" not in p.stem
             ]
+            if non_limit:
+                boundary_matches = non_limit
+
+        if boundary_matches:
+            distinct_ids = {rep.run_id for _, rep in boundary_matches}
+            if len(distinct_ids) > 1:
+                raise EvalIntegrityError(
+                    f"Ambiguous run prefix {run_id_or_path!r} matched multiple run_ids: "
+                    f"{sorted(distinct_ids)}"
+                )
+            boundary_matches.sort(key=lambda item: (item[1].run_index, item[0].name))
+            return [rep for _, rep in boundary_matches]
 
     raise FileNotFoundError(
         f"No evaluation run report JSON files found for {run_id_or_path!r} in {results_dir}"
@@ -77,13 +129,15 @@ def _compute_metrics_from_reports(reports: list[EvalRunReport]) -> ModelComparis
 
     total_cost = 0.0
     for rep in reports:
-        target = "frontier" if rep.provider == "gemini" else "local"
+        target = "frontier" if rep.provider in ("gemini", "openrouter") else "local"
         for case in rep.cases:
             if case.llm_calls:
                 for call in case.llm_calls:
                     if call.estimated_cost_usd > 0.0:
                         total_cost += call.estimated_cost_usd
-                    elif call.provider == "gemini" or call.route_target == "frontier":
+                    elif (
+                        call.provider in ("gemini", "openrouter") or call.route_target == "frontier"
+                    ):
                         total_cost += estimate_call_cost_usd(
                             "frontier", call.prompt_tokens, call.completion_tokens
                         )

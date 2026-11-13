@@ -152,16 +152,17 @@ def wilson_ci_95(successes: int, total: int) -> tuple[float, float]:
     """Compute the 95% Wilson score confidence interval (low, high) for a binomial proportion."""
     if total <= 0:
         return (0.0, 0.0)
+    clamped = max(0, min(total, successes))
     z = 1.959963984540054
     z2 = z * z
     n = float(total)
-    p = max(0.0, min(1.0, float(successes) / n))
+    p = float(clamped) / n
     denom = 1.0 + z2 / n
     center = (p + z2 / (2.0 * n)) / denom
     radicand = max(0.0, (p * (1.0 - p) / n) + (z2 / (4.0 * n * n)))
     half = (z * math.sqrt(radicand)) / denom
-    low = round(max(0.0, center - half), 6)
-    high = round(min(1.0, center + half), 6)
+    low = 0.0 if clamped == 0 else round(max(0.0, center - half), 6)
+    high = 1.0 if clamped == total else round(min(1.0, center + half), 6)
     return (low, high)
 
 
@@ -173,10 +174,13 @@ def _compute_config_hash(
     seed: int,
     prompt_version_hash: str,
     limit: int | None = None,
+    run_id: str | None = None,
 ) -> str:
     raw = f"{pool}:{provider}:{model_name}:{seed}:{prompt_version_hash}"
     if limit is not None:
         raw = f"{raw}:limit={limit}"
+    if run_id:
+        raw = f"{raw}:run_id={run_id}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
 
@@ -588,6 +592,7 @@ async def run_eval_pool(
         seed=seed,
         prompt_version_hash=prompt_hash,
         limit=limit,
+        run_id=run_id,
     )
     effective_run_id = _build_effective_run_id(
         pool=pool,

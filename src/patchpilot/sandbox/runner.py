@@ -488,7 +488,11 @@ class SandboxRunner:
         self.override_limits = dict(override_limits or {})
         self.run_logs: list[SandboxRunLog] = []
         if cleanup_on_start:
-            cleanup_leftover_containers()
+            try:
+                with SandboxLock(self.lock_path):
+                    cleanup_leftover_containers()
+            except SandboxBusyError:
+                pass
 
     def install_dependencies_sync(
         self,

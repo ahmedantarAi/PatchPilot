@@ -5,7 +5,14 @@ from __future__ import annotations
 import logging
 import time
 
-from patchpilot.providers.base import LLMProvider, LLMRequest, LLMResponse, ProviderError
+from patchpilot.providers.base import (
+    LLMProvider,
+    LLMRequest,
+    LLMResponse,
+    ProviderError,
+    _redact_secrets,
+    _sanitize_token_count,
+)
 from patchpilot.router.features import extract_task_features
 from patchpilot.router.metrics import (
     RouterMetricsSummary,
@@ -20,6 +27,15 @@ from patchpilot.router.policy import (
 )
 
 logger = logging.getLogger("patchpilot.router")
+
+
+def _provider_secrets(provider: object) -> list[str]:
+    secrets: list[str] = []
+    for attr in ("_api_key", "api_key", "_token", "token"):
+        val = getattr(provider, attr, None)
+        if isinstance(val, str) and len(val.strip()) >= 4:
+            secrets.append(val.strip())
+    return secrets
 
 
 class ModelRouter:
@@ -39,6 +55,15 @@ class ModelRouter:
         self.policy: RoutingPolicy = policy or CascadeConfidencePolicy()
         self.decisions: list[RoutingDecision] = []
         self.default_model = f"router({self.local_provider.name}+{self.frontier_provider.name})"
+
+    def __repr__(self) -> str:
+        return (
+            f"ModelRouter(local_provider={self.local_provider!r}, "
+            f"frontier_provider={self.frontier_provider!r})"
+        )
+
+    def __str__(self) -> str:
+        return self.__repr__()
 
     @property
     def last_decision(self) -> RoutingDecision | None:
@@ -96,7 +121,10 @@ class ModelRouter:
                 # Resiliency / Fallback: HTTP 429, timeout, or quota error falls back to local
                 fallback_used = True
                 route_target = "local"
-                err_text = str(exc)
+                secrets = _provider_secrets(self.frontier_provider) + _provider_secrets(
+                    self.local_provider
+                )
+                err_text = _redact_secrets(str(exc), secrets)
                 if "429" in err_text or "quota" in err_text.lower() or "rate" in err_text.lower():
                     warning_flag = f"frontier_fallback:rate_limit_429:{err_text}"
                 elif "timeout" in err_text.lower() or "transport" in err_text.lower():
@@ -104,14 +132,28 @@ class ModelRouter:
                 else:
                     warning_flag = f"frontier_fallback:provider_error:{err_text}"
                 reason = f"{reason}->fallback_to_local"
-                logger.warning("Frontier provider failed (%s); falling back to local Ollama.", exc)
-                resp = await self.local_provider.generate(request)
+                logger.warning(
+                    "Frontier provider failed (%s); falling back to local Ollama.",
+                    err_text,
+                )
+                try:
+                    resp = await self.local_provider.generate(request)
+                except ProviderError as local_exc:
+                    safe_local = _redact_secrets(str(local_exc), secrets)
+                    raise ProviderError(safe_local) from None
         else:
-            resp = await self.local_provider.generate(request)
+            try:
+                resp = await self.local_provider.generate(request)
+            except ProviderError as local_exc:
+                secrets = _provider_secrets(self.local_provider) + _provider_secrets(
+                    self.frontier_provider
+                )
+                safe_local = _redact_secrets(str(local_exc), secrets)
+                raise ProviderError(safe_local) from None
 
         latency_s = round(max(0.0, time.perf_counter() - t0), 6)
-        p_tok = resp.usage.prompt_tokens
-        c_tok = resp.usage.completion_tokens
+        p_tok = _sanitize_token_count(resp.usage.prompt_tokens)
+        c_tok = _sanitize_token_count(resp.usage.completion_tokens)
 
         actual_cost = estimate_call_cost_usd(route_target, p_tok, c_tok)
         hypothetical_gemini_cost = estimate_call_cost_usd("frontier", p_tok, c_tok)

@@ -13,6 +13,9 @@ from patchpilot.providers.base import (
     ProviderError,
     SleepFn,
     Usage,
+    _extract_secrets_for_redaction,
+    _redact_secrets,
+    _sanitize_token_count,
     post_json_with_retry,
 )
 
@@ -46,6 +49,15 @@ class OllamaProvider:
         self._transport = transport
         self._sleep = sleep
 
+    def __repr__(self) -> str:
+        secrets = _extract_secrets_for_redaction(self.base_url, None)
+        safe_url = _redact_secrets(self.base_url, secrets)
+        safe_model = _redact_secrets(self.default_model, secrets)
+        return f"OllamaProvider(base_url={safe_url!r}, default_model={safe_model!r})"
+
+    def __str__(self) -> str:
+        return self.__repr__()
+
     async def generate(self, request: LLMRequest) -> LLMResponse:
         model = (request.model or self.default_model).strip()
         if not model:
@@ -66,9 +78,10 @@ class OllamaProvider:
             "options": options,
         }
 
+        url = f"{self.base_url}/api/chat"
         data = await post_json_with_retry(
             provider_name=self.name,
-            url=f"{self.base_url}/api/chat",
+            url=url,
             payload=payload,
             timeout_s=self.timeout_s,
             max_attempts=self.max_attempts,
@@ -78,17 +91,28 @@ class OllamaProvider:
             sleep=self._sleep,
         )
 
+        if "error" in data and data["error"]:
+            secrets = _extract_secrets_for_redaction(url, None)
+            safe_err = _redact_secrets(str(data["error"]), secrets)
+            raise ProviderError(f"ollama: error in response payload: {safe_err}")
+
+        done_reason = data.get("done_reason")
+        if isinstance(done_reason, str) and done_reason.strip().lower() in ("length", "max_tokens"):
+            raise ProviderError(
+                "ollama: response truncated (finish_reason='length'); increase max_tokens"
+            )
+
         msg = data.get("message")
         if not isinstance(msg, dict):
             raise ProviderError("ollama: malformed response (missing 'message' object)")
         content = msg.get("content")
         if not isinstance(content, str):
             raise ProviderError("ollama: malformed response (missing string 'message.content')")
+        if not content.strip():
+            raise ProviderError("ollama: empty response content in 'message.content'")
 
-        raw_prompt = data.get("prompt_eval_count", 0)
-        raw_completion = data.get("eval_count", 0)
-        prompt_tokens = int(raw_prompt) if isinstance(raw_prompt, int | float) else 0
-        completion_tokens = int(raw_completion) if isinstance(raw_completion, int | float) else 0
+        prompt_tokens = _sanitize_token_count(data.get("prompt_eval_count", 0))
+        completion_tokens = _sanitize_token_count(data.get("eval_count", 0))
         resp_model = data.get("model")
 
         return LLMResponse(

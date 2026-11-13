@@ -54,6 +54,7 @@ def _parse_hunks(patch_diff: str) -> list[_Hunk]:
             and lines[idx + 2].startswith("@@")
         ):
             current = None
+            target_file = ""
             continue
         if (
             line.startswith("+++ ")
@@ -62,11 +63,10 @@ def _parse_hunks(patch_diff: str) -> list[_Hunk]:
             and idx + 1 < len(lines)
             and lines[idx + 1].startswith("@@")
         ):
-            raw_path = line[4:].split("\t", 1)[0].strip()
+            raw_path = line[4:].split("\t", 1)[0].strip().replace("\\", "/")
             if raw_path.startswith("b/"):
                 raw_path = raw_path[2:]
-            if raw_path != "/dev/null":
-                target_file = raw_path
+            target_file = "" if raw_path == "/dev/null" else raw_path
             current = None
             continue
         match = _HUNK_HEADER_RE.match(line)
@@ -109,6 +109,9 @@ def _suggestions_for_hunk(hunk: _Hunk) -> list[DiffSuggestion]:
         elif added and next_ctx is not None:
             start = end = next_ctx[0]
             repl = [*added, next_ctx[1]]
+        elif added:
+            start = end = max(1, hunk.old_start)
+            repl = list(added)
         else:
             removed, added = [], []
             return

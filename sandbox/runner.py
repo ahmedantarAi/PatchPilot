@@ -24,7 +24,7 @@ import threading
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import BinaryIO
+from typing import IO, Any
 
 MAX_OUTPUT_BYTES = 1_048_576  # 1 MB cap per SPEC §6
 MAX_PATCH_BYTES = 10 * 1024 * 1024  # 10 MB max patch size
@@ -113,7 +113,7 @@ def validate_safe_relative_path(raw_path: str, work_dir: Path) -> Path:
     return candidate
 
 
-def safe_extract_tar(stream: BinaryIO, work_dir: Path) -> ExtractedPayload:
+def safe_extract_tar(stream: IO[bytes], work_dir: Path) -> ExtractedPayload:
     """Safely unpack a tar stream into `work_dir`, rejecting links and traversal."""
     payload = ExtractedPayload()
     total_bytes = 0
@@ -164,7 +164,10 @@ def safe_extract_tar(stream: BinaryIO, work_dir: Path) -> ExtractedPayload:
                         data = fobj.read(MAX_PATCH_BYTES + 1)
                         if len(data) > MAX_PATCH_BYTES:
                             raise TarSafetyError("Patch exceeded maximum size limit")
-                        payload.patch_diff = data.decode("utf-8")
+                        try:
+                            payload.patch_diff = data.decode("utf-8")
+                        except UnicodeDecodeError as exc:
+                            raise TarSafetyError(f"Patch diff is not valid UTF-8: {exc}") from exc
                     continue
 
                 if normalized_name == META_MEMBER_NAME:
@@ -172,7 +175,12 @@ def safe_extract_tar(stream: BinaryIO, work_dir: Path) -> ExtractedPayload:
                         raise TarSafetyError("Meta entry must be a regular file")
                     fobj = tar.extractfile(member)
                     if fobj is not None:
-                        meta_raw = json.loads(fobj.read(MAX_TAR_FILE_BYTES).decode("utf-8"))
+                        try:
+                            meta_raw = json.loads(fobj.read(MAX_TAR_FILE_BYTES).decode("utf-8"))
+                        except (UnicodeDecodeError, ValueError) as exc:
+                            raise TarSafetyError(
+                                f"Meta entry is not valid UTF-8 JSON: {exc}"
+                            ) from exc
                         if isinstance(meta_raw, dict):
                             args = meta_raw.get("pytest_args", [])
                             if isinstance(args, list) and all(isinstance(a, str) for a in args):
@@ -458,7 +466,7 @@ def apply_unified_diff(diff_text: str, work_dir: Path) -> int:
     return len(patches)
 
 
-def read_stream_capped(stream: BinaryIO, cap_bytes: int = MAX_OUTPUT_BYTES) -> tuple[str, bool]:
+def read_stream_capped(stream: IO[bytes], cap_bytes: int = MAX_OUTPUT_BYTES) -> tuple[str, bool]:
     """Read from `stream` until EOF, keeping at most `cap_bytes` and draining the rest."""
     chunks: list[bytes] = []
     kept = 0
@@ -481,12 +489,12 @@ def read_stream_capped(stream: BinaryIO, cap_bytes: int = MAX_OUTPUT_BYTES) -> t
     return b"".join(chunks).decode("utf-8", errors="replace"), truncated
 
 
-def parse_junit_xml(xml_text: str) -> dict[str, object]:
+def parse_junit_xml(xml_text: str) -> dict[str, Any]:
     """Parse pytest JUnit XML into a small structured summary dictionary with caps.
 
     Safely handles or rejects hostile XML (e.g. DOCTYPE/entity expansion declarations).
     """
-    summary: dict[str, object] = {
+    summary: dict[str, Any] = {
         "tests": 0,
         "failures": 0,
         "errors": 0,
@@ -509,7 +517,7 @@ def parse_junit_xml(xml_text: str) -> dict[str, object]:
         summary["error"] = f"XMLParseError: {exc}"
         return summary
 
-    cases_list: list[dict[str, object]] = []
+    cases_list: list[dict[str, Any]] = []
     tests_total = 0
     failures_total = 0
     errors_total = 0
@@ -571,7 +579,7 @@ def run_pytest_in_work(
     work_dir: Path,
     extra_args: list[str] | None = None,
     cap_bytes: int = MAX_OUTPUT_BYTES,
-) -> dict[str, object]:
+) -> dict[str, Any]:
     """Run pytest inside `work_dir` with capped stdout/stderr and bounded JUnit XML output."""
     junit_dir = Path(tempfile.gettempdir())
     junit_path = junit_dir / "patchpilot_junit.xml"
@@ -678,19 +686,44 @@ def run_pytest_in_work(
 def run_install_deps() -> int:
     """Install pinned binary wheels into /deps with no repository files present."""
     raw_input = sys.stdin.buffer.read(MAX_TAR_FILE_BYTES).decode("utf-8", errors="replace")
-    payload = (
-        json.loads(raw_input)
-        if raw_input.strip().startswith("{")
-        else {
+    if raw_input.strip().startswith("{"):
+        try:
+            loaded = json.loads(raw_input)
+        except ValueError as exc:
+            err_obj = {
+                "exit_code": 2,
+                "cmd": [],
+                "stdout": "",
+                "stderr": f"Invalid JSON payload for --install-deps: {exc}",
+            }
+            sys.stdout.write(json.dumps(err_obj) + "\n")
+            sys.stdout.flush()
+            return 2
+        if not isinstance(loaded, dict):
+            err_obj = {
+                "exit_code": 2,
+                "cmd": [],
+                "stdout": "",
+                "stderr": "Payload for --install-deps must be a JSON object",
+            }
+            sys.stdout.write(json.dumps(err_obj) + "\n")
+            sys.stdout.flush()
+            return 2
+        payload = loaded
+    else:
+        payload = {
             "requirements": [
                 line.strip()
                 for line in raw_input.splitlines()
                 if line.strip() and not line.strip().startswith("#")
             ]
         }
+    raw_reqs = payload.get("requirements", [])
+    requirements: list[str] = (
+        [str(r) for r in raw_reqs if isinstance(r, str)] if isinstance(raw_reqs, list) else []
     )
-    requirements: list[str] = payload.get("requirements", [])
-    find_links: str | None = payload.get("find_links")
+    raw_links = payload.get("find_links")
+    find_links: str | None = str(raw_links) if isinstance(raw_links, str) and raw_links else None
 
     deps_dir = Path("/deps")
     tmp_dir = Path(tempfile.gettempdir())
@@ -833,7 +866,7 @@ def main(argv: list[str] | None = None) -> int:
             "exit_code": 0 if verified else 1,
             "pre_fix": pre_result,
             "post_fix": post_result,
-            "error": patch_err if not patch_applied else None,
+            "error": patch_err if not patch_applied else active_res.get("error"),
             "stdout": active_res.get("stdout", ""),
             "stderr": active_res.get("stderr", ""),
             "stdout_truncated": bool(active_res.get("stdout_truncated", False)),
@@ -869,7 +902,7 @@ def main(argv: list[str] | None = None) -> int:
     result = run_pytest_in_work(work_dir, extra_args=extracted.pytest_args)
     sys.stdout.write(json.dumps(result) + "\n")
     sys.stdout.flush()
-    return int(result["exit_code"])  # type: ignore[call-overload]
+    return int(result["exit_code"])
 
 
 if __name__ == "__main__":

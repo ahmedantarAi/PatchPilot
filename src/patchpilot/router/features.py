@@ -38,27 +38,28 @@ class TaskFeatures(BaseModel):
 
 def _compute_ast_stats(source: str) -> tuple[int, int, int]:
     """Return `(node_count, max_depth, function_count)` for Python source code."""
+    if not source or "\x00" in source:
+        return (0, 0, 0)
     try:
         tree = ast.parse(source)
-    except SyntaxError:
+    except (SyntaxError, ValueError, TypeError, RecursionError, MemoryError):
         return (0, 0, 0)
 
     node_count = 0
     func_count = 0
+    max_depth = 0
+    stack: list[tuple[ast.AST, int]] = [(tree, 1)]
 
-    def _walk_depth(node: ast.AST, depth: int) -> int:
-        nonlocal node_count, func_count
+    while stack:
+        node, depth = stack.pop()
         node_count += 1
+        if depth > max_depth:
+            max_depth = depth
         if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
             func_count += 1
-        max_d = depth
         for child in ast.iter_child_nodes(node):
-            child_d = _walk_depth(child, depth + 1)
-            if child_d > max_d:
-                max_d = child_d
-        return max_d
+            stack.append((child, depth + 1))
 
-    max_depth = _walk_depth(tree, 1)
     return (node_count, max_depth, func_count)
 
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import email.utils
+import math
 import random
 import re
 from collections.abc import Awaitable, Callable
@@ -12,10 +13,32 @@ from typing import Literal, Protocol, runtime_checkable
 from urllib.parse import parse_qsl, urlsplit
 
 import httpx
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 DataClass = Literal["private", "public"]
 SleepFn = Callable[[float], Awaitable[None]]
+REDACTION_MASK = "***REDACTED***"
+
+
+def _sanitize_token_count(value: object) -> int:
+    """Coerce token counts to a safe non-negative integer (clamping None/negative/NaN to 0)."""
+    if value is None or isinstance(value, bool):
+        return 0
+    if isinstance(value, int):
+        return max(0, value)
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            return 0
+        return max(0, int(value))
+    if isinstance(value, str):
+        try:
+            parsed = float(value.strip())
+            if not math.isfinite(parsed):
+                return 0
+            return max(0, int(parsed))
+        except ValueError:
+            return 0
+    return 0
 
 
 class Message(BaseModel):
@@ -34,6 +57,11 @@ class LLMRequest(BaseModel):
 class Usage(BaseModel):
     prompt_tokens: int = 0
     completion_tokens: int = 0
+
+    @field_validator("prompt_tokens", "completion_tokens", mode="before")
+    @classmethod
+    def _coerce_non_negative(cls, value: object) -> int:
+        return _sanitize_token_count(value)
 
 
 class LLMResponse(BaseModel):
@@ -66,7 +94,7 @@ def _parse_retry_after(value: str | None) -> float | None:
     stripped = value.strip()
     try:
         seconds = float(stripped)
-        if seconds >= 0.0:
+        if math.isfinite(seconds) and seconds >= 0.0:
             return seconds
     except ValueError:
         pass
@@ -90,17 +118,20 @@ _SENSITIVE_NAME_TOKENS = (
     "password",
     "credential",
 )
-_BEARER_PATTERN = re.compile(r"(?i)(Bearer\s+)[A-Za-z0-9._\-+/=]{4,}")
+_BEARER_PATTERN = re.compile(r"(?i)((?:Bearer|Basic|Token)\s+)[A-Za-z0-9._\-+/=]{4,}")
 _OPENROUTER_KEY_PATTERN = re.compile(r"\bsk-or-v1-[A-Za-z0-9_\-]{4,}")
-_GENERIC_SK_KEY_PATTERN = re.compile(r"\bsk-[A-Za-z0-9_\-]{12,}")
-_GEMINI_KEY_PATTERN = re.compile(r"\bAIza[0-9A-Za-z_\-]{12,}")
+_GENERIC_SK_KEY_PATTERN = re.compile(r"\bsk-[A-Za-z0-9_\-]{8,}")
+_GEMINI_KEY_PATTERN = re.compile(r"\bAIza[0-9A-Za-z_\-]{8,}")
+_GITHUB_TOKEN_PATTERN = re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9_]{8,}|github_pat_[A-Za-z0-9_]{8,})")
+_LANGFUSE_KEY_PATTERN = re.compile(r"\b(?:sk|pk)-lf-[A-Za-z0-9_\-]{4,}")
 _URL_PARAM_SECRET_PATTERN = re.compile(
-    r"(?i)([?&](?:api_?key|key|token|access_token|secret|password)=)[^&\s\"'<>]+"
+    r"(?i)([?&](?:api_?key|key|token|access_token|secret|password|credential)=)[^&\s\"'<>]+"
 )
 _BODY_FIELD_SECRET_PATTERN = re.compile(
     r"(?i)((?:\"(?:api_?key|apikey|x-goog-api-key|x-api-key|authorization|access_token|"
-    r"secret_key|password)\"\s*:\s*\")|(?:\b(?:api_?key|apikey|x-goog-api-key|x-api-key|"
-    r"access_token|secret_key|password)=))([^\"'\s,&]+)"
+    r"secret_key|secret|token|password|credential)\"\s*:\s*\")|(?:\b(?:api_?key|apikey|"
+    r"x-goog-api-key|x-api-key|access_token|secret_key|secret|token|password|credential)\s*=\s*))"
+    r"([^\"'\s,&}]+)"
 )
 _URL_USERINFO_PATTERN = re.compile(r"(https?://[^:/@\s]+:)[^@\s]+(@)")
 
@@ -136,17 +167,20 @@ def _extract_secrets_for_redaction(
     return sorted(secrets, key=len, reverse=True)
 
 
-def _redact_secrets(text: str, secrets: list[str]) -> str:
+def _redact_secrets(text: str, secrets: list[str] | None = None) -> str:
     redacted = text
-    for secret in secrets:
-        redacted = redacted.replace(secret, "***")
-    redacted = _BEARER_PATTERN.sub(r"\1***", redacted)
-    redacted = _OPENROUTER_KEY_PATTERN.sub("***", redacted)
-    redacted = _GENERIC_SK_KEY_PATTERN.sub("***", redacted)
-    redacted = _GEMINI_KEY_PATTERN.sub("***", redacted)
-    redacted = _URL_PARAM_SECRET_PATTERN.sub(r"\1***", redacted)
-    redacted = _BODY_FIELD_SECRET_PATTERN.sub(r"\1***", redacted)
-    redacted = _URL_USERINFO_PATTERN.sub(r"\1***\2", redacted)
+    for secret in secrets or []:
+        if secret and len(secret) >= 4:
+            redacted = redacted.replace(secret, REDACTION_MASK)
+    redacted = _BEARER_PATTERN.sub(rf"\1{REDACTION_MASK}", redacted)
+    redacted = _OPENROUTER_KEY_PATTERN.sub(REDACTION_MASK, redacted)
+    redacted = _GENERIC_SK_KEY_PATTERN.sub(REDACTION_MASK, redacted)
+    redacted = _GEMINI_KEY_PATTERN.sub(REDACTION_MASK, redacted)
+    redacted = _GITHUB_TOKEN_PATTERN.sub(REDACTION_MASK, redacted)
+    redacted = _LANGFUSE_KEY_PATTERN.sub(REDACTION_MASK, redacted)
+    redacted = _URL_PARAM_SECRET_PATTERN.sub(rf"\1{REDACTION_MASK}", redacted)
+    redacted = _BODY_FIELD_SECRET_PATTERN.sub(rf"\1{REDACTION_MASK}", redacted)
+    redacted = _URL_USERINFO_PATTERN.sub(rf"\1{REDACTION_MASK}\2", redacted)
     return redacted
 
 

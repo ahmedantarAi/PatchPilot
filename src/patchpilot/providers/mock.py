@@ -4,7 +4,13 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 
-from patchpilot.providers.base import LLMRequest, LLMResponse, ProviderError, Usage
+from patchpilot.providers.base import (
+    LLMRequest,
+    LLMResponse,
+    ProviderError,
+    Usage,
+    _redact_secrets,
+)
 
 CannedType = str | Sequence[str] | Callable[[LLMRequest], str]
 
@@ -16,6 +22,15 @@ class MockProvider:
         self._canned = canned
         self._call_index = 0
         self.calls: list[LLMRequest] = []
+
+    def __repr__(self) -> str:
+        if isinstance(self._canned, str):
+            safe_canned = _redact_secrets(self._canned)
+            return f"MockProvider(canned={safe_canned!r}, calls={len(self.calls)})"
+        return f"MockProvider(calls={len(self.calls)})"
+
+    def __str__(self) -> str:
+        return self.__repr__()
 
     async def generate(self, request: LLMRequest) -> LLMResponse:
         if not request.messages:

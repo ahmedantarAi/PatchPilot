@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import hashlib
 import logging
+import math
 import re
 from collections.abc import Mapping
 from typing import Any, Protocol, runtime_checkable
@@ -96,7 +97,7 @@ class OllamaEmbedder:
                 timeout=self.timeout_s, transport=self._transport
             ) as client:
                 res = await client.post(url, json=payload)
-        except (httpx.TimeoutException, httpx.TransportError) as exc:
+        except (httpx.HTTPError, OSError) as exc:
             raise ProviderError(f"ollama_embedder: transport error: {exc}") from exc
 
         if res.status_code != 200:
@@ -109,15 +110,29 @@ class OllamaEmbedder:
         except ValueError as exc:
             raise ProviderError("ollama_embedder: invalid JSON response") from exc
 
+        if not isinstance(data, dict):
+            raise ProviderError("ollama_embedder: JSON response is not an object")
+
         raw_embeddings = data.get("embeddings")
         if not isinstance(raw_embeddings, list):
             raise ProviderError("ollama_embedder: missing 'embeddings' list in response")
 
         result: list[list[float]] = []
         for item in raw_embeddings:
-            if not isinstance(item, list):
+            if not isinstance(item, list) or not item:
                 raise ProviderError("ollama_embedder: malformed embedding vector")
-            result.append([float(x) for x in item])
+            try:
+                vec = [float(x) for x in item if not isinstance(x, bool)]
+            except (TypeError, ValueError) as exc:
+                raise ProviderError("ollama_embedder: non-numeric embedding element") from exc
+            if len(vec) != len(item) or any(math.isnan(v) or math.isinf(v) for v in vec):
+                raise ProviderError("ollama_embedder: invalid float in embedding vector")
+            result.append(vec)
+
+        if len(result) != len(texts):
+            raise ProviderError(
+                f"ollama_embedder: expected {len(texts)} embeddings, got {len(result)}"
+            )
         return result
 
 
@@ -380,11 +395,13 @@ class QdrantStore:
                 if res.status_code != 200:
                     return []
                 data = res.json()
+                if not isinstance(data, dict):
+                    return []
                 results = data.get("result")
                 if isinstance(results, list):
                     return [r for r in results if isinstance(r, dict)]
                 return []
-        except (httpx.HTTPError, OSError) as exc:
+        except (httpx.HTTPError, OSError, ValueError) as exc:
             logger.info("Qdrant search degraded gracefully for %r: %s", collection_name, exc)
             return []
 
@@ -423,7 +440,8 @@ class QdrantStore:
             chunks.extend(extract_ast_chunks(norm_p, c))
 
         if not chunks:
-            await self.recreate_collection(col_name, dim=64)
+            if not await self.recreate_collection(col_name, dim=64):
+                return None
             return col_name
 
         texts = [
@@ -433,8 +451,21 @@ class QdrantStore:
         ]
         vecs: list[list[float]] = []
         batch_size = 64
-        for idx in range(0, len(texts), batch_size):
-            vecs.extend(await embedder.embed(texts[idx : idx + batch_size]))
+        try:
+            for idx in range(0, len(texts), batch_size):
+                batch_texts = texts[idx : idx + batch_size]
+                batch_vecs = await embedder.embed(batch_texts)
+                if len(batch_vecs) != len(batch_texts):
+                    logger.warning(
+                        "Embedder returned %d vectors for %d texts; degrading retrieval",
+                        len(batch_vecs),
+                        len(batch_texts),
+                    )
+                    return None
+                vecs.extend(batch_vecs)
+        except (ProviderError, httpx.HTTPError, OSError, ValueError) as exc:
+            logger.info("Embedder failed during case indexing; degrading gracefully: %s", exc)
+            return None
 
         dim = len(vecs[0]) if vecs and vecs[0] else 64
         if not await self.recreate_collection(col_name, dim=dim):
@@ -456,5 +487,6 @@ class QdrantStore:
                 }
             )
         for idx in range(0, len(points), batch_size):
-            await self.upsert(col_name, points[idx : idx + batch_size])
+            if not await self.upsert(col_name, points[idx : idx + batch_size]):
+                return None
         return col_name

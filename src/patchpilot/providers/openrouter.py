@@ -19,6 +19,9 @@ from patchpilot.providers.base import (
     ProviderError,
     SleepFn,
     Usage,
+    _extract_secrets_for_redaction,
+    _redact_secrets,
+    _sanitize_token_count,
     post_json_with_retry,
 )
 
@@ -57,7 +60,18 @@ class OpenRouterProvider:
         self._sleep = sleep
 
     def __repr__(self) -> str:
-        return f"OpenRouterProvider(default_model={self.default_model!r}, api_key='***')"
+        secrets = _extract_secrets_for_redaction(
+            self.base_url,
+            {"Authorization": f"Bearer {self._api_key}"},
+        )
+        safe_model = _redact_secrets(self.default_model, secrets)
+        return (
+            f"OpenRouterProvider(default_model={safe_model!r}, "
+            "api_key='***', credentials='***REDACTED***')"
+        )
+
+    def __str__(self) -> str:
+        return self.__repr__()
 
     async def generate(self, request: LLMRequest) -> LLMResponse:
         if request.data_class != "public":
@@ -106,6 +120,15 @@ class OpenRouterProvider:
             sleep=self._sleep,
         )
 
+        if "error" in data and data["error"]:
+            err_obj = data["error"]
+            err_msg = (
+                err_obj.get("message", str(err_obj)) if isinstance(err_obj, dict) else str(err_obj)
+            )
+            secrets = _extract_secrets_for_redaction(url, headers)
+            safe_err = _redact_secrets(str(err_msg), secrets)
+            raise ProviderError(f"openrouter: error in response payload: {safe_err}")
+
         choices = data.get("choices")
         if not isinstance(choices, list) or not choices:
             raise ProviderError("openrouter: malformed response (missing or empty 'choices')")
@@ -114,11 +137,38 @@ class OpenRouterProvider:
         if not isinstance(choice0, dict):
             raise ProviderError("openrouter: malformed response ('choices[0]' is not an object)")
 
-        finish_reason = choice0.get("finish_reason")
-        if finish_reason == "length":
-            raise ProviderError(
-                "openrouter: response truncated (finish_reason='length'); increase max_tokens"
+        if "error" in choice0 and choice0["error"]:
+            err_obj = choice0["error"]
+            err_msg = (
+                err_obj.get("message", str(err_obj)) if isinstance(err_obj, dict) else str(err_obj)
             )
+            secrets = _extract_secrets_for_redaction(url, headers)
+            safe_err = _redact_secrets(str(err_msg), secrets)
+            raise ProviderError(f"openrouter: choice error: {safe_err}")
+
+        finish_reason = choice0.get("finish_reason")
+        native_finish_reason = choice0.get("native_finish_reason")
+        for reason_val in (finish_reason, native_finish_reason):
+            if isinstance(reason_val, str) and reason_val.strip():
+                reason_lower = reason_val.strip().lower()
+                if reason_lower in ("length", "max_tokens"):
+                    raise ProviderError(
+                        "openrouter: response truncated (finish_reason='length'); "
+                        "increase max_tokens"
+                    )
+                if reason_lower in (
+                    "content_filter",
+                    "safety",
+                    "recitation",
+                    "blocklist",
+                    "prohibited_content",
+                    "spii",
+                    "error",
+                ):
+                    raise ProviderError(
+                        "openrouter: response blocked by safety/content filter "
+                        f"(finish_reason={reason_val!r})"
+                    )
 
         message_obj = choice0.get("message")
         if not isinstance(message_obj, dict):
@@ -138,10 +188,8 @@ class OpenRouterProvider:
         prompt_tokens = 0
         completion_tokens = 0
         if isinstance(raw_usage, dict):
-            raw_prompt = raw_usage.get("prompt_tokens", 0)
-            raw_comp = raw_usage.get("completion_tokens", 0)
-            prompt_tokens = int(raw_prompt) if isinstance(raw_prompt, int | float) else 0
-            completion_tokens = int(raw_comp) if isinstance(raw_comp, int | float) else 0
+            prompt_tokens = _sanitize_token_count(raw_usage.get("prompt_tokens", 0))
+            completion_tokens = _sanitize_token_count(raw_usage.get("completion_tokens", 0))
 
         resp_model = data.get("model")
         effective_model = resp_model if isinstance(resp_model, str) and resp_model else model

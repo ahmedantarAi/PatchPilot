@@ -195,6 +195,7 @@ class CascadeConfidencePolicy:
             local_confidence -= 0.15
         if features.ast_node_count > 50:
             local_confidence -= 0.10
+        local_confidence = max(0.0, min(1.0, local_confidence))
 
         if local_confidence < self.confidence_threshold:
             return PolicyEvaluation(

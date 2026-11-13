@@ -272,7 +272,10 @@ def safe_extract_tar(stream: IO[bytes], work_dir: Path) -> ExtractedPayload:
                         data = fobj.read(MAX_PATCH_BYTES + 1)
                         if len(data) > MAX_PATCH_BYTES:
                             raise TarSafetyError("Patch exceeded maximum size limit")
-                        payload.patch_diff = data.decode("utf-8")
+                        try:
+                            payload.patch_diff = data.decode("utf-8")
+                        except UnicodeDecodeError as exc:
+                            raise TarSafetyError(f"Patch diff is not valid UTF-8: {exc}") from exc
                     continue
 
                 if normalized_name == META_MEMBER_NAME:
@@ -280,7 +283,12 @@ def safe_extract_tar(stream: IO[bytes], work_dir: Path) -> ExtractedPayload:
                         raise TarSafetyError("Meta entry must be a regular file")
                     fobj = tar.extractfile(member)
                     if fobj is not None:
-                        meta_raw = json.loads(fobj.read(MAX_TAR_FILE_BYTES).decode("utf-8"))
+                        try:
+                            meta_raw = json.loads(fobj.read(MAX_TAR_FILE_BYTES).decode("utf-8"))
+                        except (UnicodeDecodeError, ValueError) as exc:
+                            raise TarSafetyError(
+                                f"Meta entry is not valid UTF-8 JSON: {exc}"
+                            ) from exc
                         if isinstance(meta_raw, dict):
                             args = meta_raw.get("pytest_args", [])
                             if isinstance(args, list) and all(isinstance(a, str) for a in args):

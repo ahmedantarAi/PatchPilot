@@ -14,6 +14,9 @@ from patchpilot.providers.base import (
     ProviderError,
     SleepFn,
     Usage,
+    _extract_secrets_for_redaction,
+    _redact_secrets,
+    _sanitize_token_count,
     post_json_with_retry,
 )
 
@@ -52,7 +55,18 @@ class GeminiProvider:
         self._sleep = sleep
 
     def __repr__(self) -> str:
-        return f"GeminiProvider(default_model={self.default_model!r}, api_key='***')"
+        secrets = _extract_secrets_for_redaction(
+            self.base_url,
+            {"x-goog-api-key": self._api_key},
+        )
+        safe_model = _redact_secrets(self.default_model, secrets)
+        return (
+            f"GeminiProvider(default_model={safe_model!r}, "
+            "api_key='***', credentials='***REDACTED***')"
+        )
+
+    def __str__(self) -> str:
+        return self.__repr__()
 
     async def generate(self, request: LLMRequest) -> LLMResponse:
         if request.data_class != "public":
@@ -112,12 +126,51 @@ class GeminiProvider:
             sleep=self._sleep,
         )
 
+        if "error" in data and data["error"]:
+            err_obj = data["error"]
+            err_msg = (
+                err_obj.get("message", str(err_obj)) if isinstance(err_obj, dict) else str(err_obj)
+            )
+            secrets = _extract_secrets_for_redaction(url, headers)
+            safe_err = _redact_secrets(str(err_msg), secrets)
+            raise ProviderError(f"gemini: error in response payload: {safe_err}")
+
+        prompt_feedback = data.get("promptFeedback")
+        if isinstance(prompt_feedback, dict) and prompt_feedback.get("blockReason"):
+            block_reason = prompt_feedback.get("blockReason")
+            raise ProviderError(
+                f"gemini: prompt blocked by safety filter (blockReason={block_reason!r})"
+            )
+
         candidates = data.get("candidates")
         if not isinstance(candidates, list) or not candidates:
             raise ProviderError("gemini: malformed response (missing non-empty 'candidates')")
         first = candidates[0]
         if not isinstance(first, dict):
             raise ProviderError("gemini: malformed response (candidate is not an object)")
+
+        finish_reason = first.get("finishReason") or first.get("finish_reason")
+        if isinstance(finish_reason, str) and finish_reason.strip():
+            fr_upper = finish_reason.strip().upper()
+            if fr_upper in ("MAX_TOKENS", "LENGTH"):
+                raise ProviderError(
+                    "gemini: response truncated (finish_reason='length', "
+                    f"finishReason={finish_reason!r}); increase max_tokens"
+                )
+            if fr_upper in (
+                "SAFETY",
+                "RECITATION",
+                "BLOCKLIST",
+                "PROHIBITED_CONTENT",
+                "SPII",
+                "IMAGE_SAFETY",
+                "CONTENT_FILTER",
+                "OTHER",
+            ):
+                raise ProviderError(
+                    f"gemini: candidate blocked by safety filter (finishReason={finish_reason!r})"
+                )
+
         content_obj = first.get("content")
         if not isinstance(content_obj, dict):
             raise ProviderError("gemini: malformed response (missing 'candidate.content')")
@@ -132,20 +185,20 @@ class GeminiProvider:
         if not text_chunks:
             raise ProviderError("gemini: malformed response (no text parts in candidate)")
 
+        joined_text = "".join(text_chunks)
+        if not joined_text.strip():
+            raise ProviderError("gemini: empty response content in candidate")
+
         usage_meta = data.get("usageMetadata")
         prompt_tokens = 0
         completion_tokens = 0
         if isinstance(usage_meta, dict):
-            raw_prompt = usage_meta.get("promptTokenCount", 0)
-            raw_completion = usage_meta.get("candidatesTokenCount", 0)
-            if isinstance(raw_prompt, int | float):
-                prompt_tokens = int(raw_prompt)
-            if isinstance(raw_completion, int | float):
-                completion_tokens = int(raw_completion)
+            prompt_tokens = _sanitize_token_count(usage_meta.get("promptTokenCount", 0))
+            completion_tokens = _sanitize_token_count(usage_meta.get("candidatesTokenCount", 0))
 
         model_version = data.get("modelVersion")
         return LLMResponse(
-            text="".join(text_chunks),
+            text=joined_text,
             model=model_version if isinstance(model_version, str) and model_version else model,
             provider=self.name,
             usage=Usage(prompt_tokens=prompt_tokens, completion_tokens=completion_tokens),

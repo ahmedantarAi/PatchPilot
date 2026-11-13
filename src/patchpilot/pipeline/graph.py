@@ -95,22 +95,22 @@ async def run_pipeline(
     )
 
     col_name = case_collection_name(initial_state.files)
-    if qdrant is not None and embedder is not None:
-        try:
-            await qdrant.index_case_files(initial_state.files, embedder)
-        except Exception as exc:
-            logger.info("Qdrant per-case indexing failed or degraded: %s", exc)
-
-    graph = build_pipeline_graph(
-        provider=provider,
-        sandbox_runner=sandbox_runner,
-        verify_fn=verify_fn,
-        qdrant=qdrant,
-        embedder=embedder,
-        tracer=active_tracer,
-    )
     final_state: PipelineState | None = None
     try:
+        if qdrant is not None and embedder is not None:
+            try:
+                await qdrant.index_case_files(initial_state.files, embedder)
+            except Exception as exc:
+                logger.info("Qdrant per-case indexing failed or degraded: %s", exc)
+
+        graph = build_pipeline_graph(
+            provider=provider,
+            sandbox_runner=sandbox_runner,
+            verify_fn=verify_fn,
+            qdrant=qdrant,
+            embedder=embedder,
+            tracer=active_tracer,
+        )
         result_dict = await graph.ainvoke(initial_state)
         validated = PipelineState.model_validate(result_dict)
         total_prompt = sum(c.prompt_tokens for c in active_tracer.llm_calls)
@@ -138,8 +138,7 @@ async def run_pipeline(
     finally:
         if qdrant is not None and embedder is not None:
             try:
-                if await qdrant.is_healthy():
-                    await qdrant.delete_collection(col_name)
+                await qdrant.delete_collection(col_name)
             except Exception as exc:
                 logger.info("Qdrant per-case collection cleanup degraded: %s", exc)
         try:

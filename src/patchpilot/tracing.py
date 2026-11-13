@@ -80,11 +80,13 @@ def _is_langfuse_container_running() -> bool:
             ["docker", "ps", "--filter", "name=langfuse-web", "--format", "{{.Names}}"],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=3.0,
             check=False,
         )
         return bool(proc.returncode == 0 and proc.stdout.strip())
-    except (subprocess.SubprocessError, OSError):
+    except (subprocess.SubprocessError, OSError, ValueError):
         return False
 
 
@@ -118,6 +120,9 @@ class PatchPilotTracer:
     def __repr__(self) -> str:
         return f"PatchPilotTracer(trace_id={self.trace_id!r}, configured={self.is_configured()})"
 
+    def __str__(self) -> str:
+        return self.__repr__()
+
     def is_configured(self) -> bool:
         return bool(self._enabled and self.settings.is_configured)
 
@@ -125,7 +130,7 @@ class PatchPilotTracer:
         return (self.settings.effective_public_key, self.settings.effective_secret_key)
 
     def _base_url(self) -> str:
-        return self.settings.host.rstrip("/")
+        return self.settings.host.strip().rstrip("/")
 
     async def check_health(self, *, wait_s: float = 0.0) -> bool:
         """Check if Langfuse /api/public/health returns HTTP 200."""
@@ -143,7 +148,7 @@ class PatchPilotTracer:
                     res = await client.get(url)
                     if res.status_code == 200:
                         return True
-            except (httpx.HTTPError, OSError):
+            except (httpx.HTTPError, httpx.InvalidURL, ValueError, OSError):
                 pass
 
             if time.monotonic() >= deadline:
@@ -247,20 +252,23 @@ class PatchPilotTracer:
         estimated_cost_usd: float = 0.0,
     ) -> LLMCallMetric:
         """Record an LLM generation call with model, token counts, and latency."""
-        total_tok = prompt_tokens + completion_tokens
+        safe_prompt_tok = max(0, int(prompt_tokens or 0))
+        safe_completion_tok = max(0, int(completion_tokens or 0))
+        total_tok = safe_prompt_tok + safe_completion_tok
+        safe_cost_usd = max(0.0, float(estimated_cost_usd or 0.0))
         metric = LLMCallMetric(
             node=node,
             model=model,
             provider=provider,
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
+            prompt_tokens=safe_prompt_tok,
+            completion_tokens=safe_completion_tok,
             total_tokens=total_tok,
             latency_s=round(max(0.0, latency_s), 6),
             route_target=route_target,
             decision_reason=decision_reason,
             fallback_used=fallback_used,
             warning_flag=warning_flag,
-            estimated_cost_usd=estimated_cost_usd,
+            estimated_cost_usd=safe_cost_usd,
         )
         self.llm_calls.append(metric)
 
@@ -276,8 +284,8 @@ class PatchPilotTracer:
             _otel_attr("gen_ai.system", provider),
             _otel_attr("gen_ai.request.model", model),
             _otel_attr("gen_ai.response.model", model),
-            _otel_attr("gen_ai.usage.input_tokens", prompt_tokens),
-            _otel_attr("gen_ai.usage.output_tokens", completion_tokens),
+            _otel_attr("gen_ai.usage.input_tokens", safe_prompt_tok),
+            _otel_attr("gen_ai.usage.output_tokens", safe_completion_tok),
             _otel_attr("gen_ai.usage.total_tokens", total_tok),
             _otel_attr("patchpilot.node", node),
             _otel_attr("patchpilot.latency_s", metric.latency_s),
@@ -291,8 +299,8 @@ class PatchPilotTracer:
         if warning_flag:
             attrs.append(_otel_attr("patchpilot.router.warning", warning_flag))
             attrs.append(_otel_attr("langfuse.observation.level", "WARNING"))
-        if estimated_cost_usd > 0.0:
-            attrs.append(_otel_attr("patchpilot.router.estimated_cost_usd", estimated_cost_usd))
+        if safe_cost_usd > 0.0:
+            attrs.append(_otel_attr("patchpilot.router.estimated_cost_usd", safe_cost_usd))
 
         self._otel_spans.append(
             {
@@ -325,14 +333,17 @@ class PatchPilotTracer:
         end_time: str | None = None,
     ) -> SandboxRunMetric:
         """Record a sandbox container execution span."""
+        safe_passed = max(0, int(passed or 0))
+        safe_failures = max(0, int(failures or 0))
+        safe_errors = max(0, int(errors or 0))
         metric = SandboxRunMetric(
             node=node,
             exit_code=exit_code,
             duration_s=round(max(0.0, duration_s), 6),
             patch_applied=patch_applied,
-            passed=passed,
-            failures=failures,
-            errors=errors,
+            passed=safe_passed,
+            failures=safe_failures,
+            errors=safe_errors,
             container_name=container_name,
             image_digest=image_digest,
         )
@@ -359,9 +370,9 @@ class PatchPilotTracer:
                     _otel_attr("patchpilot.node", node),
                     _otel_attr("patchpilot.sandbox.exit_code", exit_code),
                     _otel_attr("patchpilot.sandbox.patch_applied", patch_applied),
-                    _otel_attr("patchpilot.sandbox.passed", passed),
-                    _otel_attr("patchpilot.sandbox.failures", failures),
-                    _otel_attr("patchpilot.sandbox.errors", errors),
+                    _otel_attr("patchpilot.sandbox.passed", safe_passed),
+                    _otel_attr("patchpilot.sandbox.failures", safe_failures),
+                    _otel_attr("patchpilot.sandbox.errors", safe_errors),
                     _otel_attr("patchpilot.sandbox.duration_s", metric.duration_s),
                 ],
             }
@@ -404,7 +415,7 @@ class PatchPilotTracer:
                     self._otel_spans.clear()
                     return True
                 return False
-        except (httpx.HTTPError, OSError) as exc:
+        except (httpx.HTTPError, httpx.InvalidURL, ValueError, OSError) as exc:
             logger.debug("Langfuse OTLP flush skipped (unreachable): %s", type(exc).__name__)
             return False
 
@@ -489,7 +500,7 @@ class PatchPilotTracer:
                         tdata = res_tr.json()
                         if isinstance(tdata, dict) and tdata.get("id") == target_id:
                             return True
-            except (httpx.HTTPError, ValueError, OSError):
+            except (httpx.HTTPError, httpx.InvalidURL, ValueError, OSError):
                 pass
 
             if time.monotonic() >= deadline:
@@ -511,7 +522,7 @@ class PatchPilotTracer:
                     res = await client.post(url, json=payload, auth=self._auth())
                     if res.status_code in (200, 201, 409):
                         return True
-            except (httpx.HTTPError, OSError):
+            except (httpx.HTTPError, httpx.InvalidURL, ValueError, OSError):
                 return False
         return False
 
@@ -542,7 +553,7 @@ class PatchPilotTracer:
             ) as client:
                 res = await client.post(url, json=payload, auth=self._auth())
                 return res.status_code in (200, 201)
-        except (httpx.HTTPError, OSError):
+        except (httpx.HTTPError, httpx.InvalidURL, ValueError, OSError):
             return False
 
     async def create_dataset_run_item(
@@ -572,7 +583,7 @@ class PatchPilotTracer:
             ) as client:
                 res = await client.post(url, json=payload, auth=self._auth())
                 return res.status_code in (200, 201)
-        except (httpx.HTTPError, OSError):
+        except (httpx.HTTPError, httpx.InvalidURL, ValueError, OSError):
             return False
 
 

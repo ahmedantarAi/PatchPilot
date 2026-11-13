@@ -62,7 +62,7 @@ CONTAINER_RUNNER = _load_container_runner_module()
 
 
 # ---------------------------------------------------------------------------
-# 1. Unit tests — Tar safety (runs without Docker)
+# 1. Unit tests â€” Tar safety (runs without Docker)
 # ---------------------------------------------------------------------------
 
 
@@ -181,7 +181,7 @@ def test_build_repo_tar_packs_symlinks_manifest_without_host_deref(tmp_path: Pat
 
 
 # ---------------------------------------------------------------------------
-# 2. Unit tests — Unified diff application in pure Python (runs without Docker)
+# 2. Unit tests â€” Unified diff application in pure Python (runs without Docker)
 # ---------------------------------------------------------------------------
 
 
@@ -252,7 +252,7 @@ def test_apply_unified_diff_rejects_context_mismatch_and_traversal(tmp_path: Pat
 
 
 # ---------------------------------------------------------------------------
-# 3. Unit tests — Single-run lock (in-process + cross-process, no Docker)
+# 3. Unit tests â€” Single-run lock (in-process + cross-process, no Docker)
 # ---------------------------------------------------------------------------
 
 
@@ -275,7 +275,7 @@ def test_single_run_lock_in_process_and_cross_process(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 4. Unit tests — Capped output, JSON summary, injection prevention, limits
+# 4. Unit tests â€” Capped output, JSON summary, injection prevention, limits
 # ---------------------------------------------------------------------------
 
 
@@ -618,3 +618,125 @@ def test_mutation_user_caps() -> None:
     assert not fixture.check_contained(res), (
         "read_host_env fixture reported CONTAINED under weakened user/caps config (root/caps)"
     )
+
+
+# ---------------------------------------------------------------------------
+# Regression tests: dotfiles, case-insensitive DTD guard, verify/image slicing
+# ---------------------------------------------------------------------------
+
+
+def test_tar_roundtrip_preserves_dotfiles(tmp_path: Path) -> None:
+    files = {
+        ".gitignore": "*.pyc\n",
+        ".flake8": "[flake8]\n",
+        ".env.example": "A=1\n",
+        ".hidden/file.py": "x = 1\n",
+        "pkg/mod.py": "y = 2\n",
+    }
+    tar_bytes = build_repo_tar(files=files)
+    for extractor in (safe_extract_tar, CONTAINER_RUNNER.safe_extract_tar):
+        work = tmp_path / f"w_{extractor.__module__}"
+        work.mkdir()
+        extracted = extractor(io.BytesIO(tar_bytes), work)
+        assert extracted.files_extracted == len(files)
+        for rel, content in files.items():
+            assert (work / rel).read_text() == content
+        assert not (work / "gitignore").exists()
+        assert not (work / "env.example").exists()
+
+    # "./"-prefixed dotfile members are also extracted intact.
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tar:
+        data = b"x"
+        info = tarfile.TarInfo("./.gitignore")
+        info.size = len(data)
+        tar.addfile(info, io.BytesIO(data))
+    for extractor in (safe_extract_tar, CONTAINER_RUNNER.safe_extract_tar):
+        work = tmp_path / f"d_{extractor.__module__}"
+        work.mkdir()
+        extractor(io.BytesIO(buf.getvalue()), work)
+        assert (work / ".gitignore").is_file()
+
+
+@pytest.mark.parametrize("bad_name", ["../.gitignore", ".hidden/../../x", "./../x"])
+def test_tar_dotfile_fix_still_rejects_traversal(tmp_path: Path, bad_name: str) -> None:
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tar:
+        info = tarfile.TarInfo(bad_name)
+        info.size = 1
+        tar.addfile(info, io.BytesIO(b"x"))
+    for extractor, exc in (
+        (safe_extract_tar, TarSafetyError),
+        (CONTAINER_RUNNER.safe_extract_tar, CONTAINER_RUNNER.TarSafetyError),
+    ):
+        work = tmp_path / f"t_{extractor.__module__}"
+        work.mkdir(exist_ok=True)
+        with pytest.raises(exc):
+            extractor(io.BytesIO(buf.getvalue()), work)
+
+
+def test_tar_dotfile_fix_still_rejects_symlinks(tmp_path: Path) -> None:
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tar:
+        info = tarfile.TarInfo(".link")
+        info.type = tarfile.SYMTYPE
+        info.linkname = "/etc/passwd"
+        tar.addfile(info)
+    with pytest.raises(TarSafetyError):
+        safe_extract_tar(io.BytesIO(buf.getvalue()), tmp_path)
+
+
+@pytest.mark.parametrize(
+    "decl",
+    [
+        "<!doctype bomb [<!entity a 'x'>]>",
+        "<!DoCtYpE bomb>",
+        "<!DOCTYPE bomb>",
+        "<!entity a 'x'>",
+        "<!EnTiTy a 'x'>",
+    ],
+)
+def test_junit_xml_guard_is_case_insensitive(decl: str) -> None:
+    xml = f'<?xml version="1.0"?>\n{decl}<testsuites><testsuite tests="1"/></testsuites>'
+    summary = CONTAINER_RUNNER.parse_junit_xml(xml)
+    assert "Hostile XML" in str(summary.get("error"))
+    assert summary["tests"] == 0
+
+
+@pytest.mark.parametrize("verify", [False, True])
+def test_run_sync_separates_image_from_container_args(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, verify: bool
+) -> None:
+    from patchpilot.sandbox import runner as runner_mod
+
+    captured: list[list[str]] = []
+
+    class FakeProc:
+        def __init__(self, cmd: list[str], **_: object) -> None:
+            captured.append(list(cmd))
+            self.stdin = io.BytesIO()
+            self.stdout = io.BytesIO(b"")
+            self.stderr = io.BytesIO(b"")
+
+        def wait(self, timeout: float | None = None) -> int:
+            return 0
+
+    monkeypatch.setattr(runner_mod.subprocess, "Popen", FakeProc)
+    monkeypatch.setattr(runner_mod, "get_image_digest", lambda image: "sha256:test")
+    monkeypatch.setattr(runner_mod, "is_container_present", lambda name: False)
+    runner = runner_mod.SandboxRunner(
+        image="patchpilot-sandbox:test",
+        lock_path=tmp_path / "lock",
+        cleanup_on_start=False,
+    )
+    runner.run_sync(files={"a.py": "x = 1\n"}, verify=verify)
+
+    cmd = captured[0]
+    assert cmd[-2:] == ["patchpilot-sandbox:test", "--verify"] if verify else True
+    assert cmd[-1] == ("--verify" if verify else "patchpilot-sandbox:test")
+    log = runner.run_logs[-1]
+    assert "patchpilot-sandbox:test" not in log.flags
+    assert "--verify" not in log.flags
+    assert log.flags[-1] == "768m" or "--pids-limit" in log.flags
+    for required in ("--network", "none", "--read-only", "--cap-drop", "ALL", "256", "768m"):
+        assert required in log.flags

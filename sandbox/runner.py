@@ -149,7 +149,9 @@ def safe_extract_tar(stream: BinaryIO, work_dir: Path) -> ExtractedPayload:
                         f"Tar archive exceeds total unpacked limit ({MAX_TAR_TOTAL_BYTES} bytes)"
                     )
 
-                normalized_name = name.replace("\\", "/").lstrip("./")
+                normalized_name = name.replace("\\", "/")
+                while normalized_name.startswith("./"):
+                    normalized_name = normalized_name[2:]
                 if normalized_name == PATCH_MEMBER_NAME:
                     if not member.isreg():
                         raise TarSafetyError("Patch metadata entry must be a regular file")
@@ -496,7 +498,8 @@ def parse_junit_xml(xml_text: str) -> dict[str, object]:
         return summary
 
     # Reject DOCTYPE / ENTITY declarations which are never legitimate in pytest JUnit XML
-    if "<!DOCTYPE" in xml_text or "<!ENTITY" in xml_text:
+    xml_lower = xml_text.lower()
+    if "<!doctype" in xml_lower or "<!entity" in xml_lower:
         summary["error"] = "Hostile XML: DOCTYPE/ENTITY declarations rejected"
         return summary
 

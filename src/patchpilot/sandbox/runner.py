@@ -630,13 +630,16 @@ class SandboxRunner:
             "deps_volume": deps_volume,
             **self.override_limits,
         }
-        if verify:
-            run_kwargs["extra_args"] = ["--verify"]
+        cast_extra: list[str] = ["--verify"] if verify else []
+        if cast_extra:
+            run_kwargs["extra_args"] = list(cast_extra)
         cmd = build_docker_run_cmd(
             container_name,
             **run_kwargs,  # type: ignore[arg-type]
         )
-        flags = cmd[2:-1]
+        # Image sits after all docker flags and before container args (e.g. --verify).
+        image_idx = len(cmd) - len(cast_extra) - 1
+        flags = cmd[2:image_idx]
 
         with SandboxLock(self.lock_path):
             image_digest = get_image_digest(self.image)

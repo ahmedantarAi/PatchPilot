@@ -211,7 +211,7 @@ PatchPilot treats the PR author, LLM outputs, and target repository test suites 
 | **Fail-Closed Privacy Gate** | `LLMRequest.data_class` defaults to `"private"`. `ModelRouter` forces non-public requests to local Ollama; `GeminiProvider` and `OpenRouterProvider` raise `PrivacyViolationError` on non-public requests. Private GitHub repos (`base.repo.private == True`) automatically set `data_class="private"`. | `tests/providers/` and `tests/test_router.py` privacy contract suite. |
 | **Secret & Token Redaction** | Minimal environment passed to `docker` CLI; `GITHUB_TOKEN`, `PP_GEMINI_API_KEY`, `PP_OPENROUTER_API_KEY`, and Langfuse secrets are redacted as `***REDACTED***` across `__repr__`, `__str__`, and error messages. | `tests/test_review.py`, `tests/providers/`, `src/patchpilot/config.py`. |
 | **Localhost Port Binding** | All Compose ports (`127.0.0.1:6333` Qdrant, `127.0.0.1:3000`/`3030` Langfuse, `127.0.0.1:9090` MinIO) and host Ollama (`127.0.0.1:11434`) bind exclusively to loopback. | `.\tasks.ps1 config` and `docker-compose.yml` inspection. |
-| **Static Security Audit** | Zero occurrences of `shell=True`, `eval()`, `exec()`, `pickle`, `yaml.load()`, or `ET.fromstring` in `src/`. Bandit `1.9.4` scan (`uvx bandit -r src sandbox -ll`) reports **0 High-severity issues** across 11,291 lines of code (only Medium findings outside deliberate `taxonomy.py`/`fixtures.py` test payloads are Docker `--tmpfs /tmp:...` flag strings and the container-internal `ET.fromstring` guarded by `<!DOCTYPE`/`<!ENTITY` rejection). | Verified via `Select-String` AST/pattern audit and `uvx bandit -r src sandbox -ll` (2026-11-07). |
+| **Static Security Audit** | Zero occurrences of `shell=True`, `eval()`, `exec()`, `pickle`, `yaml.load()`, or `ET.fromstring` in `src/` and `sandbox/` (`sandbox/runner.py` uses `xml.parsers.expat` with `XML_PARAM_ENTITY_PARSING_NEVER`, `D-49`). Bandit `1.9.4` scan (`uvx bandit -r src sandbox -ll -x src/patchpilot/evals/taxonomy.py,src/patchpilot/sandbox/fixtures.py`) reports **`No issues identified`** — **0 High and 0 Medium issues** across 11,957 lines of code (1 `#nosec B108` skip on the container-only `SANDBOX_LIMITS["tmpfs_tmp"]` mount string). | Verified via AST/pattern audit, `tests/test_security_hardening.py`, and `uvx bandit -r src sandbox -ll -x src/patchpilot/evals/taxonomy.py,src/patchpilot/sandbox/fixtures.py` (`D-49`, 2026-11-13). |
 
 > [!WARNING]
 > **Known Limitation — Shared WSL2 Kernel (`SPEC §6`, D-17):** Hardened Docker containers share the Linux kernel of the Docker Desktop WSL2 VM with other containers (Qdrant, Langfuse). A kernel or runtime vulnerability could allow hostile code to escape into the WSL2 VM. PatchPilot v1 accepts this risk for ordinary untrusted PRs; do not run it against nation-state or purposefully weaponized kernel exploits without upgrading the runtime boundary to **gVisor (`runsc`)** or a disposable VM.
@@ -425,9 +425,9 @@ PatchPilot/
 │   ├── config.py               # Pydantic v2 settings and credential redaction
 │   ├── retrieval.py            # Per-case Qdrant REST client and `Embedder` protocol (`Ollama` / `Hash`)
 │   └── tracing.py              # Langfuse v4 OTLP/HTTP tracer and dataset run synchronization
-├── tests/                      # 125 offline unit/integration tests + 22 live/Docker containment tests
+├── tests/                      # 325 passed unit/integration tests + 22 deselected live/Docker tests
 ├── AGENTS.md                   # Mandatory engineering & evaluation integrity rules
-├── DECISIONS.md                # Architectural decision log (D-01 through D-48)
+├── DECISIONS.md                # Architectural decision log (D-01 through D-49)
 ├── PLAN.md                     # Phase 0–8 acceptance contracts and verification outputs
 ├── SPEC.md                     # System specification, threat model, and resource budget
 ├── docker-compose.yml          # Pinned Qdrant (core) and Langfuse v4 (`observability` profile) definitions
@@ -444,7 +444,7 @@ PatchPilot/
 Before finishing any change, run the full static analysis, type-checking, unit test, and Docker Compose validation suite (`AGENTS.md` Rule 10):
 
 ```powershell
-.\tasks.ps1 check     # ruff check . + ruff format --check . + mypy src + pytest -q (125 passed)
+.\tasks.ps1 check     # ruff check . + ruff format --check . + mypy src + pytest -q (325 passed, 22 deselected)
 .\tasks.ps1 config    # validates docker-compose.yml with and without --profile observability
 ```
 

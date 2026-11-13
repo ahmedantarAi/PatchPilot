@@ -540,3 +540,29 @@ def test_router_with_openrouter_frontier() -> None:
     assert resp.text == "OPENROUTER_PATCH"
     assert len(openrouter_calls) == 1
     assert openrouter_calls[0].headers.get("authorization") == "Bearer fake-openrouter-key"
+
+
+def test_file_header_regex_matches_hyphenated_paths() -> None:
+    from patchpilot.router.features import _extract_embedded_files, extract_task_features
+
+    prompt = (
+        "--- File: foo-bar.py ---\n"
+        "def a():\n    return 1\n"
+        "--- File: my-service/api-handler.py ---\n"
+        "def b():\n    return 2\n"
+        "--- Test File: tests/test-my-thing.py ---\n"
+        "def test_x():\n    assert True\n"
+    )
+    extracted = _extract_embedded_files(prompt)
+    assert set(extracted) == {
+        "foo-bar.py",
+        "my-service/api-handler.py",
+        "tests/test-my-thing.py",
+    }
+    assert "return 1" in extracted["foo-bar.py"]
+    assert "return 2" in extracted["my-service/api-handler.py"]
+
+    req = LLMRequest(messages=[Message(role="user", content=prompt)])
+    feats = extract_task_features(req)
+    assert feats.non_test_file_count == 2
+    assert feats.function_count == 2

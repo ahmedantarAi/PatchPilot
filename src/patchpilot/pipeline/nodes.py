@@ -100,6 +100,17 @@ def compute_prompt_version_hash() -> str:
     return hasher.hexdigest()
 
 
+def _dedupe_files(files: dict[str, str]) -> dict[str, str]:
+    """Collapse path aliases (e.g. `./a.py` vs `a.py`, backslashes) so a file is injected once."""
+    seen: dict[str, str] = {}
+    for path in sorted(files):
+        key = path.replace("\\", "/")
+        while key.startswith("./"):
+            key = key[2:]
+        seen.setdefault(key, path)
+    return {key: files[orig] for key, orig in seen.items()}
+
+
 def run_ast_parse(files: dict[str, str]) -> list[Finding]:
     """Parse all Python files with ast.parse to detect syntax errors."""
     findings: list[Finding] = []
@@ -202,8 +213,13 @@ async def run_llm_diff_analysis(
     parent_span_id: str | None = None,
 ) -> list[Finding]:
     """Perform LLM fault localization and inspection without ground-truth file hints."""
+    files = _dedupe_files(files)
     non_test_py_files = [p for p in sorted(files) if is_modifiable_py_file(p)]
-    test_files = [p for p in sorted(files) if is_test_file(p)]
+    test_files = [
+        p
+        for p in sorted(files)
+        if is_test_file(p) and f"{p}:\n{files[p]}" not in failing_test_output
+    ]
 
     prompt_lines = list(ANALYZE_PROMPT_TEMPLATE)
     if non_test_py_files:
@@ -432,7 +448,8 @@ def create_propose_node(
                 {"attempt": state.attempt + 1},
             )
 
-        non_test_py_files = [p for p in sorted(state.files) if is_modifiable_py_file(p)]
+        prompt_files = _dedupe_files(state.files)
+        non_test_py_files = [p for p in sorted(prompt_files) if is_modifiable_py_file(p)]
 
         prompt_parts = list(PROPOSE_PROMPT_TEMPLATE)
         if non_test_py_files:
@@ -456,7 +473,9 @@ def create_propose_node(
             prompt_parts.append("Please analyze the failure and adjust your fix accordingly.")
 
         prompt_parts.append("Repository files:")
-        for path, content in sorted(state.files.items()):
+        for path, content in sorted(prompt_files.items()):
+            if is_test_file(path) and f"{path}:\n{content}" in state.failing_test_output:
+                continue  # already injected verbatim via failing test output
             prompt_parts.append(f"--- File: {path} ---")
             prompt_parts.append(content)
 

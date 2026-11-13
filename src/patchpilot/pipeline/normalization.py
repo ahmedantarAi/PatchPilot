@@ -102,18 +102,29 @@ def validate_patch_targets(diff_text: str) -> None:
 
 
 def _strip_markdown_code_fences(text: str) -> str:
-    """Strip outermost markdown ```diff or ```python code fences if present."""
-    stripped = text.strip()
-    if stripped.startswith("```"):
-        lines = text.splitlines(keepends=True)
-        start_idx = 0
-        end_idx = len(lines)
-        if lines[0].strip().startswith("```"):
-            start_idx = 1
-        if len(lines) > 1 and lines[-1].strip() == "```":
-            end_idx = len(lines) - 1
-        return "".join(lines[start_idx:end_idx])
-    return text
+    """Strip markdown ``` fences (```diff, ```python, ...) around the payload if present.
+
+    Blank lines outside fenced blocks (leading, trailing, or between consecutive blocks) are
+    ignored; blank lines inside a block are preserved verbatim. Consecutive fenced blocks are
+    concatenated. Text without a leading fence is returned unchanged.
+    """
+    lines = text.splitlines(keepends=True)
+    idx = 0
+    while idx < len(lines) and not lines[idx].strip():
+        idx += 1
+    if idx >= len(lines) or not lines[idx].strip().startswith("```"):
+        return text
+
+    out: list[str] = []
+    while idx < len(lines) and lines[idx].strip().startswith("```"):
+        idx += 1  # skip opening fence
+        while idx < len(lines) and lines[idx].strip() != "```":
+            out.append(lines[idx])
+            idx += 1
+        idx += 1  # skip closing fence (no-op if unterminated)
+        while idx < len(lines) and not lines[idx].strip():
+            idx += 1
+    return "".join(out)
 
 
 def _content_contains_block(content: str, search_text: str) -> bool:

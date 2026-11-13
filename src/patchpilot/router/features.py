@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 
 from patchpilot.providers.base import DataClass, LLMRequest
 
-_FILE_HEADER_RE = re.compile(r"^---\s+(?:Test\s+)?File:\s+([^\s-]+)\s+---\s*$", re.MULTILINE)
+_FILE_HEADER_RE = re.compile(r"^---\s+(?:Test\s+)?File:\s+(\S+)\s+---\s*$", re.MULTILINE)
 _ERROR_TYPE_RE = re.compile(
     r"\b(AssertionError|AttributeError|TypeError|KeyError|IndexError|ValueError|"
     r"SyntaxError|NameError|RuntimeError|ZeroDivisionError|TimeoutError)\b"

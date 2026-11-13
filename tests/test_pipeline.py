@@ -1051,3 +1051,71 @@ def test_live_ollama_qwen_5_seeded_cases() -> None:
         )
 
     asyncio.run(_test())
+
+
+def test_strip_markdown_code_fences_ignores_blank_lines_outside_blocks() -> None:
+    from patchpilot.pipeline.normalization import _strip_markdown_code_fences as strip
+
+    body = "--- a/m.py\n+++ b/m.py\n@@ -1,2 +1,2 @@\n-x = 1\n+x = 2\n\n y = 3\n"
+    # plain fence, unchanged behaviour
+    assert strip(f"```diff\n{body}```") == body
+    # leading / trailing blank lines outside the fence
+    assert strip(f"\n\n```diff\n{body}```\n\n\n") == body
+    # blank lines inside the block are preserved verbatim
+    inner = "<<<<<<< SEARCH\na = 1\n\n\nb = 2\n=======\na = 2\n\n\nb = 2\n>>>>>>> REPLACE\n"
+    assert strip(f"\n```\n{inner}```\n") == inner
+    # blank lines between consecutive blocks do not corrupt content
+    two = f"```diff\n{body}```\n\n\n```diff\n{body}```\n"
+    assert strip(two) == body + body
+    # unterminated fence, and unfenced text, are handled
+    assert strip(f"\n```python\n{body}") == body
+    assert strip("no fence here\n\n") == "no fence here\n\n"
+
+
+def test_prompts_do_not_inject_identical_files_twice() -> None:
+    from patchpilot.pipeline.nodes import create_propose_node, run_llm_diff_analysis
+
+    seen: list[str] = []
+
+    class Capture(MockProvider):
+        async def generate(self, request: LLMRequest) -> LLMResponse:
+            seen.append(request.messages[-1].content)
+            return await super().generate(request)
+
+    src = "def add(a, b):\n    return a - b\n"
+    test_src = "from calc import add\n\ndef test_add():\n    assert add(1, 2) == 3\n"
+    files = {
+        "calc.py": src,
+        "./calc.py": src,  # alias of the same file
+        "tests/test_calc.py": test_src,
+    }
+    failing = f"tests/test_calc.py:\n{test_src}"
+
+    asyncio.run(
+        run_llm_diff_analysis(
+            files, Capture(canned="[]"), "private", [], failing_test_output=failing
+        )
+    )
+    prompt = seen[-1]
+    assert prompt.count("def add(a, b):") == 1
+    assert prompt.count("def test_add():") == 1
+
+    node = create_propose_node(Capture(canned="no patch"))
+    asyncio.run(
+        node(
+            PipelineState(
+                case_id="c", files=files, failing_test_output=failing, data_class="private"
+            )
+        )
+    )
+    prompt = seen[-1]
+    assert prompt.count("def add(a, b):") == 1
+    assert prompt.count("def test_add():") == 1
+
+
+def test_prompt_version_hash_unchanged_by_dedup_and_dependency_cleanup() -> None:
+    from patchpilot.pipeline.nodes import compute_prompt_version_hash
+
+    assert compute_prompt_version_hash() == (
+        "ca774b4a6efb8c2384a6f216439068326840bd10ec0543a1032f135bc0f20782"
+    )

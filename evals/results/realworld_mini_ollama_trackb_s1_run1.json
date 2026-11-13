@@ -1,7 +1,7 @@
 {
   "run_id": "realworld_mini_ollama_trackb_s1",
   "run_index": 1,
-  "timestamp": "2026-11-13T02:33:30.094740Z",
+  "timestamp": "2026-11-13T02:41:51.553085Z",
   "pool": "realworld_mini",
   "provider": "ollama",
   "model_name": "qwen2.5-coder:7b",
@@ -89,7 +89,7 @@
       "warning_flags": [],
       "total_time_s": 23.815846,
       "trace_id": "96b1a0878b3a41b2b18a84c92a349ac8",
-      "resumed": false
+      "resumed": true
     },
     {
       "case_id": "0002",
@@ -177,7 +177,7 @@
       "warning_flags": [],
       "total_time_s": 56.173278,
       "trace_id": "a5180804d658451ebc9997435a95ebba",
-      "resumed": false
+      "resumed": true
     },
     {
       "case_id": "0003",
@@ -265,7 +265,7 @@
       "warning_flags": [],
       "total_time_s": 78.124013,
       "trace_id": "1d75549c58b645d09e9f8ba1c2abadfb",
-      "resumed": false
+      "resumed": true
     },
     {
       "case_id": "0005",
@@ -353,7 +353,7 @@
       "warning_flags": [],
       "total_time_s": 21.583432,
       "trace_id": "1417415a702f41db8398375678edf825",
-      "resumed": false
+      "resumed": true
     },
     {
       "case_id": "0006",
@@ -441,7 +441,7 @@
       "warning_flags": [],
       "total_time_s": 187.079038,
       "trace_id": "ae75c307202341ed846e18458dac8378",
-      "resumed": false
+      "resumed": true
     },
     {
       "case_id": "0007",
@@ -529,7 +529,7 @@
       "warning_flags": [],
       "total_time_s": 161.176926,
       "trace_id": "5d3fcaa1790a4ebfa900d4a17bc25cd9",
-      "resumed": false
+      "resumed": true
     },
     {
       "case_id": "0008",
@@ -617,7 +617,7 @@
       "warning_flags": [],
       "total_time_s": 263.816373,
       "trace_id": "f1aa5a2efd9840aab1c059b2c923ae6c",
-      "resumed": false
+      "resumed": true
     },
     {
       "case_id": "0009",
@@ -705,7 +705,7 @@
       "warning_flags": [],
       "total_time_s": 36.387551,
       "trace_id": "94b097de7eca4cf2b0c50c9606d15ba7",
-      "resumed": false
+      "resumed": true
     },
     {
       "case_id": "0010",
@@ -793,7 +793,7 @@
       "warning_flags": [],
       "total_time_s": 37.6392,
       "trace_id": "4e5b95a6be104222b59c292fac5f78f4",
-      "resumed": false
+      "resumed": true
     },
     {
       "case_id": "0011",
@@ -881,7 +881,7 @@
       "warning_flags": [],
       "total_time_s": 51.449921,
       "trace_id": "b6bfa661d8f241318dfe8d5ee140c471",
-      "resumed": false
+      "resumed": true
     },
     {
       "case_id": "0012",
@@ -927,7 +927,7 @@
       "warning_flags": [],
       "total_time_s": 592.091596,
       "trace_id": "a44373455b674629b88b8627b225f961",
-      "resumed": false
+      "resumed": true
     },
     {
       "case_id": "0013",
@@ -1015,7 +1015,7 @@
       "warning_flags": [],
       "total_time_s": 71.609438,
       "trace_id": "06fda2bab0ff4bff9572cec9762c5553",
-      "resumed": false
+      "resumed": true
     },
     {
       "case_id": "0014",
@@ -1103,7 +1103,7 @@
       "warning_flags": [],
       "total_time_s": 113.073979,
       "trace_id": "5a35e97f8b8e458e83931ff4ae5317fa",
-      "resumed": false
+      "resumed": true
     },
     {
       "case_id": "0015",
@@ -1191,7 +1191,7 @@
       "warning_flags": [],
       "total_time_s": 111.990749,
       "trace_id": "38486ea0e82a4309939afdbb4730e193",
-      "resumed": false
+      "resumed": true
     }
   ]
 }

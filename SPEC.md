@@ -68,8 +68,9 @@ itself implements `LLMProvider`, choosing among the three by task difficulty, qu
 the data-privacy rule in §9.
 
 **Gemini model names (checked 2026-10-31 against ai.google.dev/gemini-api/docs/pricing).** Text models
-listed with a free tier: `gemini-3.8-flash` (chosen as the `.env.example` value), `gemini-3.6-flash`,
-`gemini-3.5-flash-lite`, `gemini-3.1-flash-lite`, `gemini-2.5-flash-lite`. The 2.5 family may be limited to
+listed with a free tier: `gemini-3.8-flash` (initial `.env.example` value; see `D-10`), `gemini-3.6-flash`
+(currently set in `.env.example` as `PP_GEMINI_MODEL=gemini-3.6-flash`, alongside `PP_FRONTIER_PROVIDER=openrouter`
+per `D-42`), `gemini-3.5-flash-lite`, `gemini-3.1-flash-lite`, `gemini-2.5-flash-lite`. The 2.5 family may be limited to
 projects that already used it. Names and limits change; re-check at phase 1 and whenever calls start
 failing. Rate limits (RPM/TPM/RPD) are per project and are not recorded here; read them in AI Studio.
 

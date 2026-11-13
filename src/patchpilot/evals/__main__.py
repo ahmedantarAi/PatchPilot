@@ -287,7 +287,7 @@ def main(argv: list[str] | None = None) -> int:
     p_run.add_argument(
         "--provider",
         required=True,
-        choices=["mock", "ollama", "gemini", "router"],
+        choices=["mock", "ollama", "gemini", "openrouter", "router"],
         help="LLM provider name",
     )
     p_run.add_argument("--runs", type=int, default=1, help="Number of evaluation runs (default: 1)")

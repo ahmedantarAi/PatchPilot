@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
+from collections.abc import Mapping
 from pathlib import Path
 
 from patchpilot.evals.models import BugTaxonomy, CaseDefinition, CaseMetadata, SplitManifest
@@ -15,7 +16,18 @@ from patchpilot.evals.taxonomy import (
     compute_case_content_hash,
     compute_source_hash,
 )
+from patchpilot.pipeline.normalization import is_modifiable_py_file
 from patchpilot.sandbox.fixtures import HOSTILE_FIXTURES
+
+
+def _select_buggy_source_for_hash(files: Mapping[str, str]) -> str:
+    """Select non-test Python source content deterministically for source-hash deduplication."""
+    non_test_py_paths = sorted(path for path in files if is_modifiable_py_file(path))
+    if not non_test_py_paths:
+        return ""
+    if len(non_test_py_paths) == 1:
+        return files[non_test_py_paths[0]]
+    return "\n".join(f"# {path}\n{files[path]}" for path in non_test_py_paths)
 
 
 def _round_robin_targets(
@@ -76,8 +88,7 @@ def generate_seeded_train(
     # Collect rejection sets from eval cases
     eval_content_hashes = {c.metadata.content_hash for c in eval_cases}
     eval_source_hashes = {
-        compute_source_hash(c.files.get(f"{c.metadata.template}.py", list(c.files.values())[0]))
-        for c in eval_cases
+        compute_source_hash(_select_buggy_source_for_hash(c.files)) for c in eval_cases
     }
     eval_diff_hashes = {
         hashlib.sha256(c.patch_diff.strip().encode("utf-8")).hexdigest() for c in eval_cases
@@ -115,8 +126,7 @@ def generate_seeded_train(
 
             c_hash = candidate.metadata.content_hash
             c_diff_hash = hashlib.sha256(candidate.patch_diff.strip().encode("utf-8")).hexdigest()
-            first_src = list(candidate.files.values())[0]
-            c_src_hash = compute_source_hash(first_src)
+            c_src_hash = compute_source_hash(_select_buggy_source_for_hash(candidate.files))
             c_sig = candidate.metadata.mutation_signature
 
             # Overlap checks against eval and prior train cases

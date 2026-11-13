@@ -11,9 +11,9 @@
 | D-07 | MinIO pinned by digest: `cgr.dev/chainguard/minio@sha256:3b6e40c3…7c82` (image created 2026-10-29). Chainguard's free tier exposes only `:latest`, so a digest is the only exact pin; bump deliberately | Resolved (was: unpinned `:latest`) |
 | D-08 | **Supersedes earlier draft.** FastAPI + orchestrator run on the host (`uv run`); Compose runs only Qdrant (core) and Langfuse (observability). Sandbox containers are launched by the host orchestrator via `docker run` with the flags in SPEC §6; no API or sandbox service in Compose | Removes the sandbox-vs-Docker-socket contradiction |
 | D-09 | `package = false` in uv; code runs from `src/` via PYTHONPATH | No packaging needed yet |
-| D-10 | Ollama default model `qwen2.5-coder:7b` confirmed. Gemini model name lives only in `.env` (`PP_GEMINI_MODEL`, example `gemini-3.8-flash`, checked 2026-10-31); no default in code | User decision (rev 3) |
+| D-10 | Ollama default model `qwen2.5-coder:7b` confirmed. Gemini model name lives only in `.env` (`PP_GEMINI_MODEL`, initially `gemini-3.8-flash` as of 2026-10-31; `.env.example` currently sets `PP_GEMINI_MODEL=gemini-3.6-flash` and `PP_FRONTIER_PROVIDER=openrouter` per D-42); no default in code | User decision (rev 3) |
 | D-11 | GitHub Actions pinned to major tags (`@v4`, `@v6`), uv pinned to 0.13.6; accepted for now | User decision (rev 3) |
-| D-12 | Qdrant `v1.20.0` as the only core Compose service (512 MB); Compose total 4352 MB | User requirement (rev 2) |
+| D-12 | Qdrant `v1.20.0` as the only core Compose service (512 MB); Compose total 4352 MB (later updated to 4608 MB in D-36 / `docker-compose.yml` / SPEC §8 when `langfuse-web` `mem_limit` was raised to `1280m`) | User requirement (rev 2) |
 | D-13 | Eval/train pools separated, eval split frozen before any tuning (SPEC §7); sandbox runs sequential and outside the Compose budget (SPEC §8) | User requirement (rev 2) |
 | D-14 | Never send private code to the Gemini free tier; enforced in code via request data class (SPEC §9) | User requirement (rev 2) |
 | D-15 | Langfuse memory limits accepted as-is, observability stays an optional profile, real usage to be measured later; Langfuse Cloud free tier is the documented fallback (SPEC §5) | User decision (rev 3) |

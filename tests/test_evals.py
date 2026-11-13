@@ -2,26 +2,41 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 
+from patchpilot.config import LangfuseSettings, Settings
+from patchpilot.evals.__main__ import main as evals_main
 from patchpilot.evals.freeze import freeze_eval_split, verify_frozen_eval_split
 from patchpilot.evals.generator import (
+    _select_buggy_source_for_hash,
     build_and_materialize_all,
     generate_safety_cases,
     generate_seeded_eval,
     generate_seeded_train,
 )
+from patchpilot.evals.runner import (
+    EvalSummaryReport,
+    _build_effective_run_id,
+    _compute_config_hash,
+    _resolve_default_model_name,
+    run_eval_pool,
+)
 from patchpilot.evals.taxonomy import (
     BASE_TEMPLATES,
     EVAL_TEMPLATES_PER_CLASS,
     TRAIN_TEMPLATES_PER_CLASS,
+    compute_source_hash,
     get_eval_templates_per_class,
     get_template_distribution,
     get_train_templates_per_class,
 )
 from patchpilot.evals.verifier import run_verify
+from patchpilot.sandbox.runner import JUnitReport, SandboxResult
 
 
 def test_generator_determinism() -> None:
@@ -208,3 +223,235 @@ def test_docker_sandbox_verify_sample_and_cache(tmp_path: Path) -> None:
     assert report_warm.failed == 0
     assert report_warm.cached == 10
     assert report_warm.duration_s < 2.0
+
+
+def test_evals_run_cli_openrouter_and_model_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """`evals run --provider openrouter` parses cleanly and resolves the OpenRouter model."""
+    captured: dict[str, Any] = {}
+
+    async def fake_run_eval_pool(**kwargs: Any) -> tuple[list[Any], EvalSummaryReport]:
+        captured.update(kwargs)
+        summary = EvalSummaryReport(
+            run_id="seeded_train_openrouter_s1337_deadbeef_limit1",
+            pool=str(kwargs["pool"]),
+            provider=str(kwargs["provider_name"]),
+            model_name="google/gemma-4-31b-it:free",
+            seed=int(kwargs["seed"]),
+            n_runs=int(kwargs["runs"]),
+            prompt_version_hash="0" * 64,
+            total_observations=1,
+            pass_at_1_count=1,
+            pass_at_1_rate=1.0,
+            pass_at_1_ci_95=(0.206549, 1.0),
+            pass_at_3_count=1,
+            pass_at_3_rate=1.0,
+            pass_at_3_ci_95=(0.206549, 1.0),
+        )
+        return [], summary
+
+    monkeypatch.setattr("patchpilot.evals.__main__.run_eval_pool", fake_run_eval_pool)
+
+    rc = evals_main(
+        [
+            "run",
+            "--pool",
+            "seeded_train",
+            "--provider",
+            "openrouter",
+            "--limit",
+            "1",
+            "--results-dir",
+            str(tmp_path / "results"),
+        ]
+    )
+    assert rc == 0
+    assert captured["pool"] == "seeded_train"
+    assert captured["provider_name"] == "openrouter"
+    assert captured["limit"] == 1
+
+    cfg_openrouter = Settings(
+        _env_file=None,
+        openrouter_model="google/gemma-4-31b-it:free",
+        frontier_provider="openrouter",
+    )
+    assert _resolve_default_model_name("openrouter", cfg_openrouter) == "google/gemma-4-31b-it:free"
+    assert (
+        _resolve_default_model_name("router", cfg_openrouter)
+        == "router(qwen2.5-coder:7b+google/gemma-4-31b-it:free)"
+    )
+
+    cfg_empty_openrouter = Settings(_env_file=None, openrouter_model="")
+    assert _resolve_default_model_name("openrouter", cfg_empty_openrouter) == "openrouter"
+
+    cfg_gemini_frontier = Settings(
+        _env_file=None,
+        frontier_provider="gemini",
+        gemini_model="gemini-3.6-flash",
+    )
+    assert (
+        _resolve_default_model_name("router", cfg_gemini_frontier)
+        == "router(qwen2.5-coder:7b+gemini-3.6-flash)"
+    )
+
+
+def test_evals_limit_run_uses_distinct_run_id_and_does_not_overwrite_full_report(
+    tmp_path: Path,
+) -> None:
+    """Partial `--limit` runs must get distinct config_hash/run_id/report paths from full runs."""
+    full_cfg_hash = _compute_config_hash(
+        pool="seeded_train",
+        provider="mock",
+        model_name="mock-1",
+        seed=1337,
+        prompt_version_hash="a" * 64,
+        limit=None,
+    )
+    limit_cfg_hash = _compute_config_hash(
+        pool="seeded_train",
+        provider="mock",
+        model_name="mock-1",
+        seed=1337,
+        prompt_version_hash="a" * 64,
+        limit=1,
+    )
+    assert full_cfg_hash != limit_cfg_hash
+
+    full_run_id = _build_effective_run_id(
+        pool="seeded_train",
+        provider_name="mock",
+        seed=1337,
+        config_hash=full_cfg_hash,
+        limit=None,
+    )
+    limit_run_id = _build_effective_run_id(
+        pool="seeded_train",
+        provider_name="mock",
+        seed=1337,
+        config_hash=limit_cfg_hash,
+        limit=1,
+    )
+    assert full_run_id != limit_run_id
+    assert not full_run_id.endswith("_limit1")
+    assert limit_run_id.endswith("_limit1")
+    assert (
+        _build_effective_run_id(
+            pool="seeded_train",
+            provider_name="mock",
+            seed=1337,
+            config_hash=limit_cfg_hash,
+            limit=1,
+            run_id="custom_smoke",
+        )
+        == "custom_smoke_limit1"
+    )
+    assert (
+        _build_effective_run_id(
+            pool="seeded_train",
+            provider_name="mock",
+            seed=1337,
+            config_hash=limit_cfg_hash,
+            limit=1,
+            run_id="custom_smoke_limit1",
+        )
+        == "custom_smoke_limit1"
+    )
+
+    datasets_dir = tmp_path / "datasets"
+    results_dir = tmp_path / "results"
+    build_and_materialize_all(
+        base_seed=1337,
+        datasets_dir=datasets_dir,
+        eval_count=2,
+        train_count=2,
+    )
+
+    async def fast_verify(fs: dict[str, str], patch: str) -> SandboxResult:
+        return SandboxResult(
+            exit_code=0,
+            patch_applied=True,
+            junit=JUnitReport(passed=1, failures=0, errors=0),
+        )
+
+    async def _run() -> tuple[Any, Any]:
+        full_reports, _ = await run_eval_pool(
+            pool="seeded_train",
+            provider_name="mock",
+            runs=1,
+            seed=1337,
+            limit=None,
+            datasets_dir=datasets_dir,
+            results_dir=results_dir,
+            verify_fn=fast_verify,
+            langfuse_settings=LangfuseSettings(_env_file=None),
+        )
+        limit_reports, _ = await run_eval_pool(
+            pool="seeded_train",
+            provider_name="mock",
+            runs=1,
+            seed=1337,
+            limit=1,
+            datasets_dir=datasets_dir,
+            results_dir=results_dir,
+            verify_fn=fast_verify,
+            langfuse_settings=LangfuseSettings(_env_file=None),
+        )
+        return full_reports[0], limit_reports[0]
+
+    full_report, limit_report = asyncio.run(_run())
+
+    full_path = Path(full_report.output_file)
+    limit_path = Path(limit_report.output_file)
+    assert full_path != limit_path
+    assert full_path.is_file()
+    assert limit_path.is_file()
+    assert "_limit1" not in full_path.name
+    assert "_limit1" in limit_path.name
+
+    saved_full = json.loads(full_path.read_text(encoding="utf-8"))
+    saved_limit = json.loads(limit_path.read_text(encoding="utf-8"))
+    assert saved_full["total_cases"] == 2
+    assert saved_limit["total_cases"] == 1
+
+
+def test_select_buggy_source_for_hash_excludes_tests() -> None:
+    """Source hashing must select non-test .py module(s), never test_*.py or test helpers."""
+    test_src = "def test_bug():\n    assert add(1, 2) == 3\n"
+    mod_src = "def add(a: int, b: int) -> int:\n    return a - b\n"
+
+    # Even when test_foo.py appears first in insertion order, non-test source is hashed
+    files_test_first = {
+        "test_foo.py": test_src,
+        "foo_test.py": test_src,
+        "tests/helpers.py": "HELPER = 1\n",
+        "conftest.py": "import pytest\n",
+        "README.md": "# docs\n",
+        "foo.py": mod_src,
+    }
+    selected = _select_buggy_source_for_hash(files_test_first)
+    assert selected == mod_src
+    assert compute_source_hash(selected) == compute_source_hash(mod_src)
+    assert compute_source_hash(selected) != compute_source_hash(test_src)
+
+    # Multiple non-test .py modules are combined deterministically in sorted path order
+    multi_files = {
+        "test_pkg.py": test_src,
+        "pkg/zeta.py": "Z = 2\n",
+        "pkg/alpha.py": "A = 1\n",
+    }
+    multi_selected = _select_buggy_source_for_hash(multi_files)
+    assert multi_selected == "# pkg/alpha.py\nA = 1\n\n# pkg/zeta.py\nZ = 2\n"
+    assert "test_pkg.py" not in multi_selected
+
+    # Test-only files yield empty string
+    assert _select_buggy_source_for_hash({"test_only.py": test_src}) == ""
+
+    # Generated seeded_eval case also selects its non-test source rather than test_*.py
+    sample_case = generate_seeded_eval(base_seed=1337, count=1)[0]
+    non_test_keys = [
+        k for k in sample_case.files if not k.startswith("test_") and k.endswith(".py")
+    ]
+    assert len(non_test_keys) == 1
+    assert _select_buggy_source_for_hash(sample_case.files) == sample_case.files[non_test_keys[0]]

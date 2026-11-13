@@ -160,9 +160,54 @@ def _compute_config_hash(
     model_name: str,
     seed: int,
     prompt_version_hash: str,
+    limit: int | None = None,
 ) -> str:
     raw = f"{pool}:{provider}:{model_name}:{seed}:{prompt_version_hash}"
+    if limit is not None:
+        raw = f"{raw}:limit={limit}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _resolve_default_model_name(
+    provider_name: str,
+    settings: Settings,
+    provider_override: LLMProvider | None = None,
+) -> str:
+    """Resolve the default model identifier used for config hashing and fallback reporting."""
+    if provider_override is not None:
+        return str(getattr(provider_override, "default_model", provider_override.name))
+    if provider_name == "ollama":
+        return settings.ollama_model
+    if provider_name == "gemini":
+        return settings.gemini_model or "gemini"
+    if provider_name == "openrouter":
+        return settings.openrouter_model or "openrouter"
+    if provider_name == "router":
+        frontier_model = (
+            settings.gemini_model or "gemini"
+            if settings.frontier_provider == "gemini"
+            else settings.openrouter_model or "openrouter"
+        )
+        return f"router({settings.ollama_model}+{frontier_model})"
+    return "mock-1"
+
+
+def _build_effective_run_id(
+    *,
+    pool: str,
+    provider_name: str,
+    seed: int,
+    config_hash: str,
+    limit: int | None = None,
+    run_id: str | None = None,
+) -> str:
+    """Construct the run identifier, preserving full-run IDs and isolating --limit runs."""
+    limit_suffix = f"_limit{limit}" if limit is not None else ""
+    if run_id:
+        if limit_suffix and not run_id.endswith(limit_suffix):
+            return f"{run_id}{limit_suffix}"
+        return run_id
+    return f"{pool}_{provider_name}_s{seed}_{config_hash[:8]}{limit_suffix}"
 
 
 def _checkpoint_path(
@@ -415,25 +460,28 @@ async def run_eval_pool(
     settings = Settings()
     prompt_hash = compute_prompt_version_hash()
 
-    if provider_override is not None:
-        default_model_name = getattr(provider_override, "default_model", provider_override.name)
-    elif provider_name == "ollama":
-        default_model_name = settings.ollama_model
-    elif provider_name == "gemini":
-        default_model_name = settings.gemini_model or "gemini"
-    elif provider_name == "router":
-        default_model_name = f"router({settings.ollama_model}+{settings.gemini_model or 'gemini'})"
-    else:
-        default_model_name = "mock-1"
+    default_model_name = _resolve_default_model_name(
+        provider_name,
+        settings,
+        provider_override=provider_override,
+    )
 
     config_hash = _compute_config_hash(
         pool=pool,
         provider=provider_name,
-        model_name=str(default_model_name),
+        model_name=default_model_name,
         seed=seed,
         prompt_version_hash=prompt_hash,
+        limit=limit,
     )
-    effective_run_id = run_id or f"{pool}_{provider_name}_s{seed}_{config_hash[:8]}"
+    effective_run_id = _build_effective_run_id(
+        pool=pool,
+        provider_name=provider_name,
+        seed=seed,
+        config_hash=config_hash,
+        limit=limit,
+        run_id=run_id,
+    )
     results_dir.mkdir(parents=True, exist_ok=True)
 
     # Check if Langfuse observability is up for dataset run syncing (Requirement 5)

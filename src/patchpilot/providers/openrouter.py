@@ -114,6 +114,12 @@ class OpenRouterProvider:
         if not isinstance(choice0, dict):
             raise ProviderError("openrouter: malformed response ('choices[0]' is not an object)")
 
+        finish_reason = choice0.get("finish_reason")
+        if finish_reason == "length":
+            raise ProviderError(
+                "openrouter: response truncated (finish_reason='length'); increase max_tokens"
+            )
+
         message_obj = choice0.get("message")
         if not isinstance(message_obj, dict):
             raise ProviderError("openrouter: malformed response (missing 'choices[0].message')")
@@ -122,6 +128,10 @@ class OpenRouterProvider:
         if not isinstance(content, str):
             raise ProviderError(
                 "openrouter: malformed response (missing string content in message)"
+            )
+        if not content.strip():
+            raise ProviderError(
+                "openrouter: empty response content in 'choices[0].message.content'"
             )
 
         raw_usage = data.get("usage")

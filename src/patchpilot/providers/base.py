@@ -5,9 +5,11 @@ from __future__ import annotations
 import asyncio
 import email.utils
 import random
+import re
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Literal, Protocol, runtime_checkable
+from urllib.parse import parse_qsl, urlsplit
 
 import httpx
 from pydantic import BaseModel, Field
@@ -78,6 +80,99 @@ def _parse_retry_after(value: str | None) -> float | None:
         return None
 
 
+_MAX_ERROR_BODY_CHARS = 300
+_SENSITIVE_NAME_TOKENS = (
+    "authorization",
+    "key",
+    "token",
+    "secret",
+    "auth",
+    "password",
+    "credential",
+)
+_BEARER_PATTERN = re.compile(r"(?i)(Bearer\s+)[A-Za-z0-9._\-+/=]{4,}")
+_OPENROUTER_KEY_PATTERN = re.compile(r"\bsk-or-v1-[A-Za-z0-9_\-]{4,}")
+_GENERIC_SK_KEY_PATTERN = re.compile(r"\bsk-[A-Za-z0-9_\-]{12,}")
+_GEMINI_KEY_PATTERN = re.compile(r"\bAIza[0-9A-Za-z_\-]{12,}")
+_URL_PARAM_SECRET_PATTERN = re.compile(
+    r"(?i)([?&](?:api_?key|key|token|access_token|secret|password)=)[^&\s\"'<>]+"
+)
+_BODY_FIELD_SECRET_PATTERN = re.compile(
+    r"(?i)((?:\"(?:api_?key|apikey|x-goog-api-key|x-api-key|authorization|access_token|"
+    r"secret_key|password)\"\s*:\s*\")|(?:\b(?:api_?key|apikey|x-goog-api-key|x-api-key|"
+    r"access_token|secret_key|password)=))([^\"'\s,&]+)"
+)
+_URL_USERINFO_PATTERN = re.compile(r"(https?://[^:/@\s]+:)[^@\s]+(@)")
+
+
+def _extract_secrets_for_redaction(
+    url: str,
+    headers: dict[str, str] | None,
+) -> list[str]:
+    secrets: set[str] = set()
+    if headers:
+        for key, value in headers.items():
+            lower_key = key.lower()
+            if any(tok in lower_key for tok in _SENSITIVE_NAME_TOKENS):
+                stripped = value.strip()
+                if len(stripped) >= 4:
+                    secrets.add(stripped)
+                parts = stripped.split(None, 1)
+                if len(parts) == 2 and len(parts[1].strip()) >= 4:
+                    secrets.add(parts[1].strip())
+
+    try:
+        parsed = urlsplit(url)
+        if parsed.password and len(parsed.password) >= 4:
+            secrets.add(parsed.password)
+        for q_key, q_val in parse_qsl(parsed.query, keep_blank_values=False):
+            if any(tok in q_key.lower() for tok in _SENSITIVE_NAME_TOKENS):
+                q_stripped = q_val.strip()
+                if len(q_stripped) >= 4:
+                    secrets.add(q_stripped)
+    except ValueError:
+        pass
+
+    return sorted(secrets, key=len, reverse=True)
+
+
+def _redact_secrets(text: str, secrets: list[str]) -> str:
+    redacted = text
+    for secret in secrets:
+        redacted = redacted.replace(secret, "***")
+    redacted = _BEARER_PATTERN.sub(r"\1***", redacted)
+    redacted = _OPENROUTER_KEY_PATTERN.sub("***", redacted)
+    redacted = _GENERIC_SK_KEY_PATTERN.sub("***", redacted)
+    redacted = _GEMINI_KEY_PATTERN.sub("***", redacted)
+    redacted = _URL_PARAM_SECRET_PATTERN.sub(r"\1***", redacted)
+    redacted = _BODY_FIELD_SECRET_PATTERN.sub(r"\1***", redacted)
+    redacted = _URL_USERINFO_PATTERN.sub(r"\1***\2", redacted)
+    return redacted
+
+
+def _format_error_body_snippet(
+    response: httpx.Response,
+    *,
+    url: str,
+    headers: dict[str, str] | None,
+    max_chars: int = _MAX_ERROR_BODY_CHARS,
+) -> str:
+    try:
+        raw_text = response.text
+    except (httpx.HTTPError, UnicodeDecodeError, AttributeError):
+        return ""
+
+    collapsed = " ".join(raw_text.split())
+    if not collapsed:
+        return ""
+
+    secrets = _extract_secrets_for_redaction(url, headers)
+    redacted = _redact_secrets(collapsed, secrets)
+    if len(redacted) > max_chars:
+        return redacted[:max_chars].rstrip() + "..."
+    return redacted
+
+
 def _compute_backoff(attempt: int, base_delay_s: float, max_delay_s: float) -> float:
     exp_delay = min(max_delay_s, base_delay_s * float(1 << (attempt - 1)))
     return float(exp_delay * random.uniform(0.5, 1.0))
@@ -139,12 +234,16 @@ async def post_json_with_retry(
                     )
                     await sleep(delay)
                     continue
+                snippet = _format_error_body_snippet(response, url=url, headers=headers)
+                detail = f": {snippet}" if snippet else ""
                 raise ProviderError(
-                    f"{provider_name}: HTTP {status} after {max_attempts} attempt(s)"
+                    f"{provider_name}: HTTP {status} after {max_attempts} attempt(s){detail}"
                 )
 
+            snippet = _format_error_body_snippet(response, url=url, headers=headers)
+            detail = f": {snippet}" if snippet else ""
             raise ProviderError(
-                f"{provider_name}: non-retryable HTTP {status} on attempt {attempt}"
+                f"{provider_name}: non-retryable HTTP {status} on attempt {attempt}{detail}"
             )
 
     raise ProviderError(f"{provider_name}: exhausted retry loop")

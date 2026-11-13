@@ -31,7 +31,7 @@ from patchpilot.pipeline.nodes import VerifyCallable, compute_prompt_version_has
 from patchpilot.providers import get_provider
 from patchpilot.providers.base import LLMProvider
 from patchpilot.providers.mock import MockProvider
-from patchpilot.retrieval import HashEmbedder, OllamaEmbedder, QdrantStore
+from patchpilot.retrieval import Embedder, HashEmbedder, OllamaEmbedder, QdrantStore
 from patchpilot.sandbox.runner import SandboxResult, SandboxRunner
 from patchpilot.sandbox.tar_and_diff import JUnitReport, PatchApplyError, apply_unified_diff
 from patchpilot.tracing import LLMCallMetric, PatchPilotTracer
@@ -68,6 +68,10 @@ class EvalCaseRunResult(BaseModel):
     borderline: bool = False
     failure_cause: str = ""
     llm_calls: list[LLMCallMetric] = Field(default_factory=list)
+    local_calls: int = 0
+    frontier_calls: int = 0
+    fallback_count: int = 0
+    warning_flags: list[str] = Field(default_factory=list)
     total_time_s: float = 0.0
     trace_id: str = ""
     resumed: bool = False
@@ -108,6 +112,10 @@ class EvalRunReport(BaseModel):
     total_completion_tokens: int
     total_tokens: int
     total_time_s: float
+    local_calls: int = 0
+    frontier_calls: int = 0
+    fallback_count: int = 0
+    warning_flags: list[str] = Field(default_factory=list)
     langfuse_dataset_synced: bool = False
     output_file: str = ""
     cases: list[EvalCaseRunResult] = Field(default_factory=list)
@@ -130,6 +138,10 @@ class EvalSummaryReport(BaseModel):
     pass_at_3_count: int
     pass_at_3_rate: float
     pass_at_3_ci_95: tuple[float, float]
+    local_calls: int = 0
+    frontier_calls: int = 0
+    fallback_count: int = 0
+    warning_flags: list[str] = Field(default_factory=list)
     by_taxonomy: list[BreakdownRow] = Field(default_factory=list)
     by_template: list[BreakdownRow] = Field(default_factory=list)
     run_files: list[str] = Field(default_factory=list)
@@ -267,6 +279,72 @@ def _compute_breakdown(
     return rows
 
 
+def _select_embedder(provider_name: str, settings: Settings) -> Embedder:
+    """Select `HashEmbedder` only for mock mode and `OllamaEmbedder` for live providers."""
+    if provider_name == "mock":
+        return HashEmbedder(dim=64)
+    return OllamaEmbedder(base_url=settings.ollama_base_url, model=settings.ollama_model)
+
+
+def _extract_call_telemetry(
+    llm_calls: list[LLMCallMetric],
+) -> tuple[int, int, int, list[str]]:
+    """Aggregate local_calls, frontier_calls, fallback_count, and unique warning_flags."""
+    local_calls = 0
+    frontier_calls = 0
+    fallback_count = 0
+    warning_flags: list[str] = []
+    seen_warnings: set[str] = set()
+
+    for call in llm_calls:
+        if call.route_target == "local":
+            local_calls += 1
+        elif call.route_target == "frontier":
+            frontier_calls += 1
+        elif call.provider == "ollama":
+            local_calls += 1
+        elif call.provider in ("gemini", "openrouter"):
+            frontier_calls += 1
+
+        if call.fallback_used:
+            fallback_count += 1
+        if call.warning_flag and call.warning_flag not in seen_warnings:
+            seen_warnings.add(call.warning_flag)
+            warning_flags.append(call.warning_flag)
+
+    return local_calls, frontier_calls, fallback_count, warning_flags
+
+
+def _aggregate_case_telemetry(
+    cases: list[EvalCaseRunResult],
+) -> tuple[int, int, int, list[str]]:
+    """Aggregate routing and fallback telemetry across `EvalCaseRunResult` records."""
+    local_calls = 0
+    frontier_calls = 0
+    fallback_count = 0
+    warning_flags: list[str] = []
+    seen_warnings: set[str] = set()
+
+    for case in cases:
+        if case.llm_calls:
+            c_local, c_frontier, c_fallbacks, c_warnings = _extract_call_telemetry(case.llm_calls)
+        else:
+            c_local = case.local_calls
+            c_frontier = case.frontier_calls
+            c_fallbacks = case.fallback_count
+            c_warnings = case.warning_flags
+
+        local_calls += c_local
+        frontier_calls += c_frontier
+        fallback_count += c_fallbacks
+        for flag in c_warnings:
+            if flag and flag not in seen_warnings:
+                seen_warnings.add(flag)
+                warning_flags.append(flag)
+
+    return local_calls, frontier_calls, fallback_count, warning_flags
+
+
 def build_eval_summary(run_reports: list[EvalRunReport]) -> EvalSummaryReport:
     """Validate prompt-version hash consistency across runs and build the aggregated summary."""
     if not run_reports:
@@ -290,6 +368,28 @@ def build_eval_summary(run_reports: list[EvalRunReport]) -> EvalSummaryReport:
     p1 = sum(1 for c in all_cases if c.pass_at_1)
     p3 = sum(1 for c in all_cases if c.pass_at_3)
 
+    total_local = 0
+    total_frontier = 0
+    total_fallbacks = 0
+    summary_warnings: list[str] = []
+    seen_warnings: set[str] = set()
+
+    for rep in run_reports:
+        c_local, c_frontier, c_fallbacks, c_warnings = _aggregate_case_telemetry(rep.cases)
+        if c_local == 0 and c_frontier == 0 and c_fallbacks == 0 and not c_warnings:
+            c_local = rep.local_calls
+            c_frontier = rep.frontier_calls
+            c_fallbacks = rep.fallback_count
+            c_warnings = rep.warning_flags
+
+        total_local += c_local
+        total_frontier += c_frontier
+        total_fallbacks += c_fallbacks
+        for flag in c_warnings:
+            if flag and flag not in seen_warnings:
+                seen_warnings.add(flag)
+                summary_warnings.append(flag)
+
     first = run_reports[0]
     return EvalSummaryReport(
         run_id=first.run_id,
@@ -306,6 +406,10 @@ def build_eval_summary(run_reports: list[EvalRunReport]) -> EvalSummaryReport:
         pass_at_3_count=p3,
         pass_at_3_rate=round(p3 / total_obs, 6) if total_obs else 0.0,
         pass_at_3_ci_95=wilson_ci_95(p3, total_obs),
+        local_calls=total_local,
+        frontier_calls=total_frontier,
+        fallback_count=total_fallbacks,
+        warning_flags=summary_warnings,
         by_taxonomy=_compute_breakdown(all_cases, lambda c: c.taxonomy),
         by_template=_compute_breakdown(all_cases, lambda c: c.template),
         run_files=[rep.output_file for rep in run_reports if rep.output_file],
@@ -334,7 +438,18 @@ def format_eval_summary(summary: EvalSummaryReport) -> str:
             f"({summary.pass_at_3_rate:.1%}) "
             f"[95% Wilson CI: {p3_lo:.1%}, {p3_hi:.1%}]"
         ),
+        (
+            f"Routing telemetry: local_calls={summary.local_calls} | "
+            f"frontier_calls={summary.frontier_calls} | "
+            f"fallback_count={summary.fallback_count}"
+        ),
     ]
+    if summary.warning_flags:
+        lines.append(f"Warning flags ({len(summary.warning_flags)}):")
+        for flag in summary.warning_flags[:10]:
+            lines.append(f"  - {flag}")
+        if len(summary.warning_flags) > 10:
+            lines.append(f"  - ... (+{len(summary.warning_flags) - 10} more)")
     if summary.pool == REALWORLD_MINI_POOL or summary.pool.startswith(REALWORLD_MINI_POOL):
         overflow_cnt = sum(1 for c in summary.cases if c.context_overflow)
         lines.append(
@@ -497,11 +612,7 @@ async def run_eval_pool(
             description=f"PatchPilot {pool} dataset",
         )
 
-    embedder = (
-        OllamaEmbedder(base_url=settings.ollama_base_url, model=settings.ollama_model)
-        if provider_name in ("ollama", "router") and provider_override is None
-        else HashEmbedder(dim=64)
-    )
+    embedder = _select_embedder(provider_name, settings)
     qdrant = QdrantStore(base_url="http://127.0.0.1:6333", timeout_s=1.0)
 
     effective_verify_fn = verify_fn
@@ -630,6 +741,9 @@ async def run_eval_pool(
             p1_final = final_state.pass_at_1 and not is_overflow if is_rw else final_state.pass_at_1
             p3_final = final_state.pass_at_k and not is_overflow if is_rw else final_state.pass_at_k
 
+            case_llm_calls = list(final_state.llm_calls)
+            c_local, c_frontier, c_fallbacks, c_warnings = _extract_call_telemetry(case_llm_calls)
+
             case_result = EvalCaseRunResult(
                 case_id=case_id,
                 pool=pool,
@@ -652,7 +766,11 @@ async def run_eval_pool(
                 context_overflow=is_overflow,
                 borderline=is_borderline,
                 failure_cause=fail_cause,
-                llm_calls=list(final_state.llm_calls),
+                llm_calls=case_llm_calls,
+                local_calls=c_local,
+                frontier_calls=c_frontier,
+                fallback_count=c_fallbacks,
+                warning_flags=c_warnings,
                 total_time_s=case_elapsed,
                 trace_id=final_state.trace_id,
                 resumed=False,
@@ -698,6 +816,7 @@ async def run_eval_pool(
         p3_cnt = sum(1 for c in run_cases if c.pass_at_3)
         tot_prompt = sum(c.prompt_tokens for c in run_cases)
         tot_comp = sum(c.completion_tokens for c in run_cases)
+        run_local, run_frontier, run_fallbacks, run_warnings = _aggregate_case_telemetry(run_cases)
         out_path = results_dir / f"{effective_run_id}_run{run_idx}.json"
 
         report = EvalRunReport(
@@ -720,6 +839,10 @@ async def run_eval_pool(
             total_completion_tokens=tot_comp,
             total_tokens=tot_prompt + tot_comp,
             total_time_s=round(sum(c.total_time_s for c in run_cases) or run_duration, 6),
+            local_calls=run_local,
+            frontier_calls=run_frontier,
+            fallback_count=run_fallbacks,
+            warning_flags=run_warnings,
             langfuse_dataset_synced=obs_up,
             output_file=out_path.as_posix(),
             cases=run_cases,

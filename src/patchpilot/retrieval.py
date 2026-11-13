@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import logging
+import re
 from collections.abc import Mapping
 from typing import Any, Protocol, runtime_checkable
 
@@ -45,7 +47,7 @@ class HashEmbedder:
 
     def _embed_single(self, text: str) -> list[float]:
         vec = [0.0] * self.dim
-        tokens = text.split()
+        tokens = re.findall(r"\w+", text.lower())
         if not tokens:
             return vec
 
@@ -117,6 +119,157 @@ class OllamaEmbedder:
                 raise ProviderError("ollama_embedder: malformed embedding vector")
             result.append([float(x) for x in item])
         return result
+
+
+def _node_line_span(node: ast.stmt) -> tuple[int, int]:
+    """Return 1-based `(start_line, end_line)` including decorators for an AST statement."""
+    decorators = getattr(node, "decorator_list", [])
+    start_line = min([node.lineno] + [d.lineno for d in decorators])
+    end_line = getattr(node, "end_lineno", None) or node.lineno
+    return (start_line, end_line)
+
+
+def _clean_chunk_path(file_path: str) -> str:
+    norm = file_path.replace("\\", "/")
+    while norm.startswith("./"):
+        norm = norm[2:]
+    return norm
+
+
+def extract_ast_chunks(file_path: str, content: str) -> list[dict[str, Any]]:
+    """Chunk a Python file by AST definitions (`ClassDef`, `FunctionDef`, `AsyncFunctionDef`).
+
+    Returns chunk dicts with keys `{"file", "symbol", "start_line", "end_line", "text"}`.
+    Falls back to bounded line windows on `SyntaxError`.
+    """
+    norm_path = _clean_chunk_path(file_path)
+    lines = content.splitlines()
+    if not lines or not content.strip():
+        return []
+
+    try:
+        tree = ast.parse(content, filename=norm_path)
+    except SyntaxError:
+        chunks: list[dict[str, Any]] = []
+        window = 60
+        step = 50
+        for idx in range(0, len(lines), step):
+            end_idx = min(len(lines), idx + window)
+            chunk_text = "\n".join(lines[idx:end_idx])
+            if chunk_text.strip():
+                chunks.append(
+                    {
+                        "file": norm_path,
+                        "symbol": f"<lines:{idx + 1}-{end_idx}>",
+                        "start_line": idx + 1,
+                        "end_line": end_idx,
+                        "text": chunk_text,
+                    }
+                )
+            if end_idx >= len(lines):
+                break
+        return chunks
+
+    top_defs = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef)
+    ]
+    if not top_defs:
+        return [
+            {
+                "file": norm_path,
+                "symbol": "<module>",
+                "start_line": 1,
+                "end_line": len(lines),
+                "text": "\n".join(lines),
+            }
+        ]
+
+    chunks = []
+    cursor = 1
+    for node in top_defs:
+        n_start, n_end = _node_line_span(node)
+        if n_start > cursor:
+            gap_text = "\n".join(lines[cursor - 1 : n_start - 1])
+            if gap_text.strip():
+                chunks.append(
+                    {
+                        "file": norm_path,
+                        "symbol": "<module>",
+                        "start_line": cursor,
+                        "end_line": n_start - 1,
+                        "text": gap_text,
+                    }
+                )
+
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+            chunks.append(
+                {
+                    "file": norm_path,
+                    "symbol": node.name,
+                    "start_line": n_start,
+                    "end_line": n_end,
+                    "text": "\n".join(lines[n_start - 1 : n_end]),
+                }
+            )
+        else:
+            sub_defs = [
+                child
+                for child in node.body
+                if isinstance(child, ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef)
+            ]
+            if not sub_defs:
+                chunks.append(
+                    {
+                        "file": norm_path,
+                        "symbol": node.name,
+                        "start_line": n_start,
+                        "end_line": n_end,
+                        "text": "\n".join(lines[n_start - 1 : n_end]),
+                    }
+                )
+            else:
+                first_sub_start = _node_line_span(sub_defs[0])[0]
+                if first_sub_start > n_start:
+                    header_text = "\n".join(lines[n_start - 1 : first_sub_start - 1])
+                    if header_text.strip():
+                        chunks.append(
+                            {
+                                "file": norm_path,
+                                "symbol": node.name,
+                                "start_line": n_start,
+                                "end_line": first_sub_start - 1,
+                                "text": header_text,
+                            }
+                        )
+                for sub in sub_defs:
+                    s_start, s_end = _node_line_span(sub)
+                    chunks.append(
+                        {
+                            "file": norm_path,
+                            "symbol": f"{node.name}.{sub.name}",
+                            "start_line": s_start,
+                            "end_line": s_end,
+                            "text": "\n".join(lines[s_start - 1 : s_end]),
+                        }
+                    )
+        cursor = n_end + 1
+
+    if cursor <= len(lines):
+        tail_text = "\n".join(lines[cursor - 1 :])
+        if tail_text.strip():
+            chunks.append(
+                {
+                    "file": norm_path,
+                    "symbol": "<module>",
+                    "start_line": cursor,
+                    "end_line": len(lines),
+                    "text": tail_text,
+                }
+            )
+
+    return chunks
 
 
 class QdrantStore:
@@ -253,24 +406,55 @@ class QdrantStore:
         files: Mapping[str, str],
         embedder: Embedder,
     ) -> str | None:
-        """Recreate the per-case collection from the case content hash and index .py files."""
+        """Recreate the per-case collection from the case content hash and index AST chunks."""
         if not await self.is_healthy():
             return None
 
         col_name = case_collection_name(files)
-        non_test_files = [(p, c) for p, c in sorted(files.items()) if is_modifiable_py_file(p)]
-        if not non_test_files:
+        seen_paths: set[str] = set()
+        chunks: list[dict[str, Any]] = []
+        for p, c in sorted(files.items()):
+            if not is_modifiable_py_file(p):
+                continue
+            norm_p = _clean_chunk_path(p)
+            if norm_p in seen_paths:
+                continue
+            seen_paths.add(norm_p)
+            chunks.extend(extract_ast_chunks(norm_p, c))
+
+        if not chunks:
             await self.recreate_collection(col_name, dim=64)
             return col_name
 
-        texts = [f"{p}:\n{c}" for p, c in non_test_files]
-        vecs = await embedder.embed(texts)
+        texts = [
+            f"{ch['file']}::{ch['symbol']} "
+            f"(lines {ch['start_line']}-{ch['end_line']}):\n{ch['text']}"
+            for ch in chunks
+        ]
+        vecs: list[list[float]] = []
+        batch_size = 64
+        for idx in range(0, len(texts), batch_size):
+            vecs.extend(await embedder.embed(texts[idx : idx + batch_size]))
+
         dim = len(vecs[0]) if vecs and vecs[0] else 64
         if not await self.recreate_collection(col_name, dim=dim):
             return None
 
         points: list[dict[str, Any]] = []
-        for i, ((p, c), v) in enumerate(zip(non_test_files, vecs, strict=True)):
-            points.append({"id": i + 1, "vector": v, "payload": {"file": p, "text": c}})
-        await self.upsert(col_name, points)
+        for i, (ch, v) in enumerate(zip(chunks, vecs, strict=True)):
+            points.append(
+                {
+                    "id": i + 1,
+                    "vector": v,
+                    "payload": {
+                        "file": ch["file"],
+                        "symbol": ch["symbol"],
+                        "start_line": ch["start_line"],
+                        "end_line": ch["end_line"],
+                        "text": ch["text"],
+                    },
+                }
+            )
+        for idx in range(0, len(points), batch_size):
+            await self.upsert(col_name, points[idx : idx + batch_size])
         return col_name
